@@ -1,0 +1,43 @@
+# #1069: `scripts/test-closing-keyword-utils.cjs` pins the
+# `extractCandidateNumbers()`/`collectCovered()` reference implementation
+# that `closing-keyword-check.yml` and `agent/bin/check-pr-references` both
+# carry as hand-synced inline copies — but until now nothing ran it in CI
+# (same gap `tracking-parent-auto-closer-test.yml` closed for its own test
+# file, #564; this workflow mirrors that one's shape exactly). Without this,
+# the new cross-repo test coverage added in #1069 is only ever exercised by
+# hand. Path-filtered so it only fires on PRs actually touching the pinned
+# module, its test, or either hand-synced copy.
+#
+# `.cjs`, not `.js` (platform#1069 follow-up): a product repo's
+# `package.json` can set `"type": "module"`, which makes Node treat every
+# bare `.js` file as an ES module — `require`/`module.exports` then throw
+# `ReferenceError: require is not defined in ES module scope`. `.cjs` forces
+# CommonJS regardless of the consuming repo's `"type"` field (platform has
+# no `package.json` at all, which is why this never surfaced here first —
+# partners-portal#35 caught it).
+name: closing-keyword-utils-test
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - "scripts/closing-keyword-utils.cjs"
+      - "scripts/test-closing-keyword-utils.cjs"
+      - ".github/workflows/closing-keyword-check.yml"
+      - "agent/bin/check-pr-references"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: closing-keyword-utils-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run extractCandidateNumbers()/collectCovered() fixture tests
+        run: node --test scripts/test-closing-keyword-utils.cjs
