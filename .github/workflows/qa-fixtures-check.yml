@@ -1,0 +1,156 @@
+# platform#541 (split from #534, item 5 of 5): "specs pair with tickets"
+# (#453/PR#458, recurred and re-fixed via #507/#510) already showed what
+# happens to a good-but-optional convention in this company — it rots until
+# the CEO catches the gap by hand. The CTO's ask here is the same fix
+# pattern applied to a different pairing: a product-repo PR that ships new
+# or changed user-facing functionality (a route, a form, a calculation, an
+# interactive control) should pair with a `qa/fixtures.json` addition or
+# update in the same repo (schema/precedent: tax-app#121, consumed by
+# `agent/bin/render-interact` per platform#538/agent/roles/qa.md), or state
+# in the PR body why no fixture change applies.
+#
+# This lives as a CI lint rather than (only) reviewer.md prose because the
+# enforcement is structural and self-propagating: this file is a normal
+# entry in `.github/workflows/`, so `scripts/bootstrap-product-repo.sh`'s
+# enumerate-and-denylist model (#512/#515) picks it up automatically —
+# no denylist entry needed here, unlike platform-only workflows — and
+# `sync-governance-workflows.yml` re-syncs it into every live product repo
+# on every push to platform's main that touches this directory. A new
+# product repo gets this check from the moment `bootstrap-product-repo.sh`
+# runs against it, with zero manual wiring.
+#
+# Deliberately scoped OUT of the platform repo itself (`if:` below) even
+# though this very file lives here — platform is the control plane, not a
+# product repo with its own `qa/fixtures.json` convention (see #541's
+# explicit "not the platform repo itself"). The file still needs to exist
+# in platform's `.github/workflows/` so the sync/bootstrap scripts have a
+# source copy to propagate.
+#
+# Same shape as `closing-keyword-check.yml`: no checkout needed, reads the
+# PR's changed-file list and text straight off the GitHub API, self-hosted
+# arm64 runner (node/jq/gh/aws, no python3 —
+# `infra/ci_runner_bootstrap.sh.tftpl`), heredoc'd Node script. Only needs
+# the same-repo `github.token` (read PR files + body) — no cross-repo AWS
+# role, unlike sync-governance-workflows.yml.
+#
+# Detection is a heuristic, not a perfect classifier: any changed file
+# under a `src/`/`app/` tree with a `.tsx`/`.ts`/`.jsx`/`.js`/`.vue`/
+# `.svelte` extension, excluding tests/stories, is treated as
+# "user-facing-shaped" and requires either a `qa/fixtures.json` diff in the
+# same PR or the word "fixture" appearing somewhere in the PR title/body as
+# an explicit justification (mirrors closing-keyword-check's
+# closing-keyword-or-explicit-marker escape hatch). False positives (a
+# pure refactor, a copy tweak, a style-only change) are expected and cheap
+# to clear — say why in the PR body, same as any other borderline case
+# reviewer.md hands to human/agent judgment.
+name: qa-fixtures-check
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: qa-fixtures-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    # Job id is "check" (matching the sibling closing-keyword-check.yml/
+    # commitment-ledger-check.yml/operator-boundary-check.yml convention),
+    # but that means all four report an identically-named "check" check run
+    # on the same commit — GitHub's required-status-check matching is by
+    # check-run name only, with no per-workflow disambiguation, so requiring
+    # bare "check" would be satisfied by any of the four, not specifically
+    # this one. This job-level `name:` makes the reported check-run name
+    # (and hence the required-status-check context) unique: "qa-fixtures-check"
+    # (verified live via `gh api repos/<repo>/commits/<sha>/check-runs`,
+    # platform#1531).
+    name: qa-fixtures-check
+    if: github.repository != 'quineworks/platform'
+    runs-on: ondemand-x86_64
+    steps:
+      - name: Check for a paired qa/fixtures.json change or an explicit justification
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          cat > /tmp/qa-fixtures-check.js <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+
+          const REPO = process.env.REPO;
+          const PR_NUMBER = process.env.PR_NUMBER;
+          const text = `${process.env.PR_TITLE || ''}\n${process.env.PR_BODY || ''}`;
+
+          function fetchChangedFiles() {
+            const files = [];
+            let page = 1;
+            for (;;) {
+              const out = execFileSync('gh', [
+                'api',
+                `repos/${REPO}/pulls/${PR_NUMBER}/files`,
+                '-X', 'GET',
+                '-f', `per_page=100`,
+                '-f', `page=${page}`,
+              ], { encoding: 'utf8' });
+              const batch = JSON.parse(out);
+              for (const f of batch) files.push(f.filename);
+              if (batch.length < 100) break;
+              page += 1;
+            }
+            return files;
+          }
+
+          const changedFiles = fetchChangedFiles();
+
+          const FIXTURE_PATH = 'qa/fixtures.json';
+          const touchedFixture = changedFiles.includes(FIXTURE_PATH);
+
+          const UI_FILE_RE = /(^|\/)(src|app)\/.*\.(tsx|ts|jsx|js|vue|svelte)$/i;
+          const EXCLUDE_RE = /(^|\/)(__tests__|__mocks__)\/|\.(test|spec|stories)\.[^/]+$/i;
+
+          // Exact-path allowlist for files confirmed (tax-lane#965, tax-lane#2492) to be
+          // pure, hook-free, router-free typed data arrays with no rendered markup.
+          // Deliberately an exact-path list, not a directory-wide exclude — see
+          // platform#3220.
+          const CONTENT_DATA_ALLOWLIST = new Set([
+            'web/src/lib/content/changelogEntries.ts',
+          ]);
+
+          const uiTouchingFiles = changedFiles.filter(
+            (f) => UI_FILE_RE.test(f) && !EXCLUDE_RE.test(f) && !CONTENT_DATA_ALLOWLIST.has(f)
+          );
+
+          if (uiTouchingFiles.length === 0) {
+            console.log('No user-facing-shaped files changed; qa/fixtures.json pairing not required.');
+            process.exit(0);
+          }
+
+          if (touchedFixture) {
+            console.log(`qa/fixtures.json updated alongside ${uiTouchingFiles.length} user-facing-shaped file(s). OK.`);
+            process.exit(0);
+          }
+
+          const justified = /\bfixture/i.test(text);
+
+          if (justified) {
+            console.log('qa/fixtures.json not touched, but the PR title/body explicitly addresses fixtures. OK.');
+            process.exit(0);
+          }
+
+          console.log(
+            `::error::This PR changes user-facing-shaped file(s) (${uiTouchingFiles.join(', ')}) ` +
+            `without updating ${FIXTURE_PATH} and without an explicit justification. Either add/update ` +
+            `${FIXTURE_PATH} for the new or changed behavior, or state in the PR description why no fixture ` +
+            `change applies (e.g. "backend-only change, no new interactive surface") — see platform#541.`
+          );
+          process.exit(1);
+          NODE_EOF
+          node /tmp/qa-fixtures-check.js
