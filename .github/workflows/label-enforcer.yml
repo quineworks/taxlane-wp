@@ -1,0 +1,138 @@
+# Issue #83 sat unowned for hours: it was filed (by the shared `quineworks`
+# service account every agent commits/files as) without an `agent-<role>`
+# label, so nothing tracking ownership by label ever saw it — a
+# chief-of-staff run only caught it by manually eyeballing `gh issue list`
+# during memory curation. Issue #85 asked for a durable, automatic catch so
+# that can't repeat silently.
+#
+# This fires on the label-relevant issue events (not just `opened` — an
+# `agent-<role>` label removed later, e.g. by an over-eager relabel, is the
+# same gap) and flags any open issue with zero `agent-<role>` labels:
+#
+#   1. Applies the `needs-label` marker (visible on the issue itself, same
+#      idea as `changes-requested`/`needs-ceo-decision` elsewhere in this
+#      repo — a label the automation sets/clears, not freeform text a
+#      workflow would have to parse back out, see request-review.yml).
+#   2. Comments once, so it's visible without needing to know the marker
+#      label exists.
+#   3. Enqueues a `cto` triage job the same way ci-sentinel.yml enqueues an
+#      engineer straight from Actions (no Lambda round-trip needed to react
+#      -- github_actions_queue in infra/github.tf already grants this role
+#      sqs:SendMessage on the work queue) -- so the gap gets *routed*, not
+#      just flagged for someone to notice on their own.
+#
+# The `needs-label` marker doubles as this workflow's own dedupe state: no
+# DynamoDB claim needed (contrast ci-sentinel.yml/changelog.yml, which do
+# need one because their trigger has no equivalent durable marker). Once
+# applied, a later edit that still lacks an agent-<role> label is a no-op
+# here — comment/enqueue already happened, and issue #85's cadence
+# requirement (flagged within roughly the pump's 10-minute sweep) is already
+# met the instant this first ran. If an agent-<role> label is later added,
+# the marker is removed automatically (self-healing, no stale label left
+# behind).
+name: label-enforcer
+
+on:
+  issues:
+    types: [opened, labeled, unlabeled]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: label-enforcer-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  enforce:
+    runs-on: ondemand-x86_64
+    steps:
+      - name: Ensure the needs-label marker exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh label create needs-label \
+            --repo "$REPO" \
+            --color fbca04 \
+            --description "No agent-<role> label found; flagged by label-enforcer.yml (issue #85)" \
+            --force
+
+      - name: Check label state
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          # An issue can be transferred to another repo between this job being
+          # queued and this step running (#176 -> quineworks/tax-app#7) — the
+          # number no longer resolves in $REPO at all. That's not a labeling
+          # gap, it's just not this repo's issue anymore, so treat it as a
+          # no-op rather than a hard failure.
+          if ! LABELS=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")' 2>err.txt); then
+            if grep -qi "could not resolve to an issue" err.txt; then
+              echo "Issue #${ISSUE_NUMBER} no longer exists in ${REPO} (likely transferred to another repo) — nothing to enforce, skipping." >&2
+              echo "has_role=true" >> "$GITHUB_OUTPUT"
+              echo "has_marker=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cat err.txt >&2
+            exit 1
+          fi
+          echo "Current labels: ${LABELS}" >&2
+
+          HAS_ROLE=false
+          if echo ",${LABELS}," | grep -qE ',agent-[a-z-]+,'; then
+            HAS_ROLE=true
+          fi
+          HAS_MARKER=false
+          if echo ",${LABELS}," | grep -q ',needs-label,'; then
+            HAS_MARKER=true
+          fi
+
+          echo "has_role=${HAS_ROLE}" >> "$GITHUB_OUTPUT"
+          echo "has_marker=${HAS_MARKER}" >> "$GITHUB_OUTPUT"
+
+      - name: Self-heal — remove stale marker once an agent-<role> label lands
+        if: steps.check.outputs.has_role == 'true' && steps.check.outputs.has_marker == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-label
+
+      - name: Flag — apply marker and comment
+        if: steps.check.outputs.has_role == 'false' && steps.check.outputs.has_marker == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --add-label needs-label
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body \
+            "No \`agent-<role>\` label found on this issue — it's invisible to anyone tracking ownership by label (see #83, #85). Routing to \`cto\` to label and own/route it."
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.check.outputs.has_role == 'false' && steps.check.outputs.has_marker == 'false'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Enqueue cto triage job
+        if: steps.check.outputs.has_role == 'false' && steps.check.outputs.has_marker == 'false'
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        # chat_id must match var.ceo_chat_ids in infra/variables.tf — GitHub
+        # Actions has no read access to Terraform state, so this list is
+        # kept in sync by hand (same note as request-review.yml).
+        run: |
+          BODY=$(jq -n \
+            --arg ctx "Issue #${ISSUE_NUMBER} (\"${ISSUE_TITLE}\") has no agent-<role> label — label-enforcer.yml flagged it. Read the issue, apply the correct agent-<role> label, and either own it or delegate it onward per normal CTO routing." \
+            '{role: "cto", context: $ctx, chat_id: "1952896608,5209713934", depth: 0}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
