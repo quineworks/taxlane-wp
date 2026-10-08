@@ -1,0 +1,130 @@
+# Failed CI used to be invisible until an agent happened to look (#19): a
+# workflow could sit red on main overnight and nobody would know. This
+# workflow fires whenever one of the company's other workflows finishes with
+# a failing conclusion and enqueues an engineer job to triage it — fetch the
+# logs, find the root cause, fix it / re-run it / or report why the failure
+# is expected (e.g. the #18 deploy-role bootstrap chicken-and-egg).
+#
+# Loop guard, part 1: `workflows:` below deliberately does not name this
+# workflow. workflow_run only fires for runs of workflows in that list, so a
+# sentinel failure can't summon itself. New workflows must be added to the
+# list by hand — they're silently uncovered until then, which is the
+# tradeoff for not being able to self-reference.
+#
+# Loop guard, part 2: GitHub can redeliver the same workflow_run event (retry
+# after a timeout, a manual re-run of the *failed* run) — the DynamoDB
+# conditional put below caps enqueues at one per run id regardless.
+#
+# Audit (tax-lane#953): this list had drifted from the actual set of
+# workflows across product repos — the test suite itself (`CI`/`ci`) wasn't
+# on it, so a real Test-step failure on tax-lane's main sat unnoticed until a
+# GitHub notification email surfaced it by chance. `workflow_run` matches on
+# a workflow's `name:` field, case-sensitively, filename-independent — hence
+# both `CI` (tax-lane's capitalization) and `ci` (pouchbooks') below. Added
+# every push-to-main/schedule/issues-triggered workflow across platform,
+# tax-lane, and pouchbooks that has no PR gate to catch a failure some other
+# way (matching the shape of build-agent/infra-apply/changelog already
+# here): the test suites (CI, ci, backend-ci), the production deploys
+# (web-deploy, backend-deploy) whose failure means prod silently didn't
+# update, their downstream smoke tests (e2e-account-lifecycle,
+# e2e-barcode-scan, e2e-storefront-order-verify), the /status-page driver
+# (status, same issues-triggered shape as label-enforcer), the cross-repo governance sync
+# (sync-governance-workflows), and two more issues-only-triggered workflows
+# (#1971): tracking-parent-auto-closer (`issues: closed` only, same shape as
+# status/label-enforcer) and issue-close-enforcer (its `pull_request`
+# trigger is `types: [closed]`, i.e. post-merge — it cannot block a merge,
+# so despite also having a `pull_request` trigger it isn't a real PR gate
+# and needed to be added here, not excluded below). Deliberately left out:
+# workflows already gated on a *pre-merge* `pull_request` check
+# (closing-keyword-check, commitment-ledger-check, cost-gate-check,
+# no-security-theater, operator-boundary-check,
+# pouchbooks-feature-drift-check-test, qa-fixtures-check,
+# sitemap-lastmod-check, vpce-sg-check, and the `*-test`/request-review/
+# design-review workflows) — those block the PR itself on failure, so
+# they're already visible without a sentinel; and pouchbooks' `release`
+# (tag-push/workflow_dispatch only, a deliberate human action, not a
+# silent post-merge failure mode).
+name: ci-sentinel
+
+on:
+  workflow_run:
+    workflows:
+      [
+        build-agent,
+        infra-plan,
+        infra-apply,
+        request-review,
+        changelog,
+        label-enforcer,
+        design-review,
+        CI,
+        ci,
+        backend-ci,
+        web-deploy,
+        backend-deploy,
+        e2e-account-lifecycle,
+        e2e-barcode-scan,
+        e2e-storefront-order-verify,
+        status,
+        sync-governance-workflows,
+        tracking-parent-auto-closer,
+        issue-close-enforcer,
+      ]
+    types: [completed]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  triage:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ondemand-x86_64
+    steps:
+      # sentinel-dedupe-claim and enqueue-review-jobs (infra/sentinel.tf,
+      # infra/github.tf) both now live on the repo:quineworks/*:*-trusted
+      # role — this workflow propagates to every product repo (#509/#512),
+      # not just quineworks/platform, so one auth step up front covers both
+      # the dedupe claim and the SQS enqueue below.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Claim this run id (dedupe)
+        id: claim
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set +e
+          OUT=$(aws dynamodb put-item \
+            --table-name quineworks-state \
+            --item "{\"pk\": {\"S\": \"sentinel-run-${RUN_ID}\"}}" \
+            --condition-expression "attribute_not_exists(pk)" 2>&1)
+          STATUS=$?
+          set -e
+
+          if [[ $STATUS -eq 0 ]]; then
+            echo "claimed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$OUT" == *ConditionalCheckFailedException* ]]; then
+            echo "claimed=false" >> "$GITHUB_OUTPUT"
+            echo "Run ${RUN_ID} already claimed — skipping duplicate enqueue" >&2
+          else
+            echo "$OUT" >&2
+            exit "$STATUS"
+          fi
+
+      - name: Enqueue engineer triage job
+        if: steps.claim.outputs.claimed == 'true'
+        env:
+          WORKFLOW_NAME: ${{ github.event.workflow_run.name }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          BODY=$(jq -n \
+            --arg ctx "CI sentinel: workflow '${WORKFLOW_NAME}' failed on branch '${BRANCH}' (${HEAD_SHA:0:7}). Run: ${RUN_URL}. Fetch the failed logs via gh, determine the root cause, and either fix it with a PR, re-run it if the failure looks transient, or report exactly why the failure is expected (name the reason, e.g. a known bootstrap chicken-and-egg). State which of the three in your closing report." \
+            '{role: "engineer", context: $ctx, chat_id: "1952896608", depth: 0}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
