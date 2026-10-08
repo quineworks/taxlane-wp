@@ -1,0 +1,58 @@
+# TOUGH GUARDRAIL (CEO directive 2026-07-09): the company delivers work; it
+# does NOT build machinery to police itself. This check FAILS any PR that
+# re-introduces the retired security-theater apparatus — the exact class that
+# caused the runaway issue-creation loop (#313-#348) and burned days of cycles
+# on "unverified CEO approval" incidents that were never real.
+#
+# It is deliberately narrow (concrete artifacts, not fuzzy prose) so it never
+# blocks real product work — and it creates NO issues and posts NO comments,
+# so it can never itself loop. It just fails the check.
+name: no-security-theater
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: no-security-theater-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject re-introduction of self-policing apparatus
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+
+          # 1. Ban new/modified workflow or script FILES whose whole purpose is
+          #    approval/fabrication/provenance policing.
+          bad_files=$(git diff --name-only --diff-filter=AM "$BASE...$HEAD" \
+            | grep -iE '(fabrication|approval-audit|approval-claim|ceo-approval-claim|check_ceo_approval)' || true)
+          if [ -n "$bad_files" ]; then
+            echo "::error::This PR adds retired security-theater files:"
+            echo "$bad_files"
+            echo "The company does not build fabrication/approval-audit machinery (CEO directive 2026-07-09). Remove these."
+            exit 1
+          fi
+
+          # 2. Ban ADDING logic that auto-creates issues about CEO-approval /
+          #    fabrication, or auto-gates work behind needs-ceo-decision. Only
+          #    looks at added lines in workflows/roles, so it can't false-fire
+          #    on documentation of the retirement itself in memory/docs.
+          added=$(git diff "$BASE...$HEAD" -- '.github/**' 'agent/roles/**' ':(exclude).github/workflows/no-security-theater.yml' | grep -E '^\+' | grep -v '^\+\+\+' || true)
+          if echo "$added" | grep -qiE "gh issue create.*(fabrication|ceo.?approval|unverifiable)|apply.?label.*fabrication-suspect|add-label needs-ceo-decision"; then
+            echo "::error::This PR re-adds self-policing behavior (auto-filing approval/fabrication issues or auto-gating work behind needs-ceo-decision). Retired 2026-07-09 — agents deliver assigned work without approval checks. Remove it."
+            exit 1
+          fi
+
+          echo "No security-theater apparatus introduced. Pass — go deliver."
