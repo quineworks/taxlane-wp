@@ -1,0 +1,242 @@
+# Post-merge safety net for #522, companion to `closing-keyword-check.yml`.
+# That check catches the common case before merge; this one catches
+# whatever slips through anyway (a squash-merge that drops the keyword
+# parsing, a renamed default branch, an edited-after-merge body, or simply
+# a PR that predates the preventive check). Same shape as
+# `label-enforcer.yml`: a marker label doubles as this workflow's own
+# dedupe state, and a `cto` triage job gets enqueued straight from Actions
+# rather than auto-closing — a PR can legitimately be partial progress, so
+# a human-shaped judgment call (routed to `cto`) confirms before anything
+# closes.
+#
+# Two triggers in one file:
+#   - `pull_request` `closed`, gated on `.merged == true`: extract the same
+#     bare `#NNN` set used by `closing-keyword-check.yml` from the merged
+#     PR's title+body, resolve each via `gh api repos/$REPO/issues/$NNN`
+#     (skip PRs, skip unresolved numbers), and for any resolved issue still
+#     `open` — regardless of *why* GitHub's own keyword-close didn't fire —
+#     apply the `needs-close-check` marker label + one comment linking the
+#     merged PR, then enqueue a `cto` triage job. Gated on the marker not
+#     already being present per issue, so redelivered events or multiple
+#     merges referencing the same stale issue don't spam duplicate
+#     comments/enqueues.
+#   - `issues` `closed`: if the closed issue carries `needs-close-check`,
+#     remove it (self-heal, mirrors `label-enforcer.yml`'s own marker
+#     removal when an `agent-<role>` label lands).
+#
+# Runner has node/jq/gh/aws, no python3 (`infra/ci_runner_bootstrap.sh.tftpl`)
+# — same heredoc'd Node approach as `closing-keyword-check.yml`.
+#
+# #2195: both `gh label create` (Ensure-marker step) and `gh issue view`
+# (Self-heal step) 503'd bare, one-shot, with no retry — same failure class
+# reviewer.md's review-verdict status POST hit and was hardened against in
+# #2191/PR#2192 (bounded retry w/ backoff on transient GitHub API 5xx). Every
+# un-retried `gh` write/read in this workflow gets the same `retry()` wrapper
+# below; the one exception is the "Flag" step's own `gh issue view` dedupe
+# check, which already degrades gracefully on failure (falls back to `""`,
+# i.e. "not flagged yet") by design, not by omission.
+name: issue-close-enforcer
+
+on:
+  pull_request:
+    types: [closed]
+  issues:
+    types: [closed]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: issue-close-enforcer-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  enforce:
+    runs-on: ondemand-x86_64
+    steps:
+      - name: Ensure the needs-close-check marker exists
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
+
+          if ! retry gh label create needs-close-check \
+            --repo "$REPO" \
+            --color fbca04 \
+            --description "Merged PR had no closing keyword; issue still open. Flagged by issue-close-enforcer.yml (#522)" \
+            --force; then
+            echo "::error::gh label create failed after 5 attempts (transient GitHub API 5xx) — #2195" >&2
+            exit 1
+          fi
+
+      - name: Scan merged PR for referenced issues left open
+        id: scan
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          cat > /tmp/issue-close-enforcer-scan.js <<'NODE_EOF'
+          'use strict';
+          const fs = require('fs');
+          const { execFileSync } = require('child_process');
+
+          const REPO = process.env.REPO;
+          const CURRENT_REPO = REPO && REPO.includes('/') ? REPO.split('/')[1] : REPO;
+          const text = `${process.env.PR_TITLE || ''}\n${process.env.PR_BODY || ''}`;
+
+          function stripCode(t) {
+            return t
+              .replace(/```[\s\S]*?```/g, ' ')
+              .replace(/`[^`]*`/g, ' ');
+          }
+
+          // A reponame#NNN (no owner) is only a same-repo self-reference
+          // (needs coverage) when reponame matches this repo; otherwise it's
+          // an already-scoped cross-repo shorthand and is skipped, same as
+          // owner/repo#NNN (#608).
+          function extractCandidateNumbers(s, currentRepo) {
+            const numbers = new Set();
+            const re = /#(\d+)/g;
+            let m;
+            while ((m = re.exec(s)) !== null) {
+              const before = s.slice(0, m.index);
+              const wordMatch = before.match(/[A-Za-z0-9_.\-\/]*$/);
+              const word = wordMatch ? wordMatch[0] : '';
+              if (word.includes('/')) continue; // owner/repo#NNN — true cross-repo, skip.
+              if (word && currentRepo && word.toLowerCase() !== currentRepo.toLowerCase()) {
+                continue; // reponame#NNN naming a different repo — true cross-repo shorthand, skip.
+              }
+              const context = before.slice(-20).trimEnd();
+              if (/\b(pull request|pr)\s*$/i.test(context)) continue;
+              numbers.add(Number(m[1]));
+            }
+            return numbers;
+          }
+
+          const candidates = extractCandidateNumbers(stripCode(text), CURRENT_REPO);
+          const leaked = [];
+
+          for (const n of candidates) {
+            let data;
+            try {
+              const out = execFileSync('gh', ['api', `repos/${REPO}/issues/${n}`], { encoding: 'utf8' });
+              data = JSON.parse(out);
+            } catch (e) {
+              continue; // unresolved -> nothing this workflow can act on.
+            }
+            if (data.pull_request) continue; // it's a PR, not an issue.
+            if (data.state === 'open') leaked.push(n);
+          }
+
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `leaked=${leaked.join(',')}\n`);
+          console.log(leaked.length > 0
+            ? `Referenced issue(s) still open after merge: ${leaked.map((n) => '#' + n).join(', ')}`
+            : 'No referenced issues left open — nothing to flag.');
+          NODE_EOF
+          node /tmp/issue-close-enforcer-scan.js
+
+      - name: Flag newly-leaked issues
+        id: flag
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == true && steps.scan.outputs.leaked != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          LEAKED: ${{ steps.scan.outputs.leaked }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
+
+          NEWLY_FLAGGED=()
+          IFS=',' read -ra NUMS <<< "$LEAKED"
+          for N in "${NUMS[@]}"; do
+            [ -z "$N" ] && continue
+            LABELS=$(gh issue view "$N" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")
+            if echo ",${LABELS}," | grep -q ',needs-close-check,'; then
+              echo "Issue #${N} already flagged — skipping duplicate." >&2
+              continue
+            fi
+            if ! retry gh issue edit "$N" --repo "$REPO" --add-label needs-close-check; then
+              echo "::error::gh issue edit --add-label failed after 5 attempts for #${N} (transient GitHub API 5xx) — #2195" >&2
+              exit 1
+            fi
+            if ! retry gh issue comment "$N" --repo "$REPO" --body \
+              "Merged PR ${PR_URL} references this issue but it's still open, and the PR carried no closing keyword (Closes/Fixes/Resolves #NNN) — see #522. Routing to \`cto\` to confirm whether this is actually done and should close, or genuinely still open (partial-progress PR)."; then
+              echo "::error::gh issue comment failed after 5 attempts for #${N} (transient GitHub API 5xx) — #2195" >&2
+              exit 1
+            fi
+            NEWLY_FLAGGED+=("$N")
+          done
+          # Comma-joined, no trailing separator issues since we build with printf.
+          OUT=$(IFS=,; echo "${NEWLY_FLAGGED[*]:-}")
+          echo "newly_flagged=${OUT}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == true && steps.flag.outputs.newly_flagged != ''
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Enqueue cto triage job
+        if: github.event_name == 'pull_request' && github.event.pull_request.merged == true && steps.flag.outputs.newly_flagged != ''
+        env:
+          NEWLY_FLAGGED: ${{ steps.flag.outputs.newly_flagged }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        # chat_id must match var.ceo_chat_ids in infra/variables.tf — GitHub
+        # Actions has no read access to Terraform state, so this list is
+        # kept in sync by hand (same note as label-enforcer.yml/
+        # request-review.yml).
+        run: |
+          ISSUE_LIST=$(echo "$NEWLY_FLAGGED" | sed 's/^/#/; s/,/, #/g')
+          BODY=$(jq -n \
+            --arg ctx "Merged PR ${PR_URL} (#${PR_NUMBER}) referenced issue(s) ${ISSUE_LIST} with no closing keyword, and they're still open — issue-close-enforcer.yml flagged them with needs-close-check. Confirm whether each is actually done (close it, linking the PR) or genuinely still open (partial-progress PR — leave open, remove needs-close-check, comment why). Before dispatching any new remediation work for a flagged issue, search for other open issues/PRs already referencing it (e.g. gh issue list --search \"#<N> in:body,title\" --state open, gh pr list --search \"#<N> in:body,title\" --state open) across relevant repos. If one is already in flight, let it finish (comment + remove needs-close-check once it lands) instead of starting a second, independent chain." \
+            '{role: "cto", context: $ctx, chat_id: "1952896608,5209713934", depth: 0}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
+
+      - name: Self-heal — remove stale marker when the issue closes
+        if: github.event_name == 'issues'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
+
+          if ! LABELS=$(retry gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")'); then
+            echo "::error::gh issue view failed after 5 attempts (transient GitHub API 5xx) — #2195" >&2
+            exit 1
+          fi
+          if echo ",${LABELS}," | grep -q ',needs-close-check,'; then
+            if ! retry gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-close-check; then
+              echo "::error::gh issue edit --remove-label failed after 5 attempts (transient GitHub API 5xx) — #2195" >&2
+              exit 1
+            fi
+          fi
