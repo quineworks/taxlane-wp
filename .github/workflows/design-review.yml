@@ -1,0 +1,211 @@
+# Event-driven designer<->product review loop for design PRs (#490, parent
+# #489 — CEO directive that a designer must not ship a design PR alone;
+# product must review it, and revisions must go back and forth until product
+# is actually satisfied).
+#
+# This mirrors request-review.yml's own precedent exactly, for the same
+# reason: MAX_DELEGATION_DEPTH = 3 caps `delegate` chains, and a
+# designer<->product ping-pong via plain `delegate <role> "..."` calls would
+# dead-end after ~2 rounds (design-loop dispatches designer at depth 0 ->
+# designer delegates to product at depth 1 -> product delegates back to
+# designer at depth 2 -> designer delegates to product again at depth 3,
+# still OK -> product tries to delegate back a second time at depth 4 ->
+# REFUSED, silently dropped). See #13/#40, the exact bug class
+# request-review.yml was built to avoid for reviewer re-dispatch. Instead,
+# every hop here is a GitHub Actions enqueue straight onto SQS at a **fixed**
+# `depth: 1` (not chained off whatever depth triggered it), so the loop's
+# length is bounded by GitHub events (PR opens, label flips, pushes), not by
+# `MAX_DELEGATION_DEPTH`.
+#
+# Scoped to PRs whose head branch matches `design/**` (designer's existing
+# branch-naming convention, agent/roles/designer.md) via the job-level `if`,
+# since `on.pull_request` can't filter on head branch directly (`branches:`
+# filters the base branch).
+#
+# Four routes, matching the four events this loop actually needs:
+#
+#   1. opened/reopened/ready_for_review -> enqueue product to do the first
+#      review.
+#   2. labeled `design-changes-requested` (product wasn't satisfied) ->
+#      enqueue designer to revise.
+#   3. synchronize (a push fixing the PR), gated on `design-changes-requested`
+#      currently being present — exact same gate shape request-review.yml
+#      uses for its own synchronize handling, and for the same reason: the
+#      label is an explicit signal set/cleared by product
+#      (agent/roles/product.md), not something inferred by parsing product's
+#      freeform review comment text (see #40) -> enqueue product to re-review.
+#   4. labeled `design-approved` (product is satisfied) -> enqueue reviewer
+#      directly, so the merge happens promptly instead of waiting on an
+#      unrelated PR event to re-trigger request-review.yml. reviewer.md's own
+#      design/** hold state still requires this label present before it will
+#      actually merge.
+#
+# `concurrency` collapses rapid label flips/pushes into one enqueue per
+# (PR, meaningful-event) pair, the same idiom request-review.yml uses, so a
+# fast label correction or multi-commit push doesn't fan out duplicate
+# enqueues.
+#
+# #1962: same self-healing gap request-review.yml closed for itself in #673 —
+# an `opened`/`labeled` event can be dropped before a run is even created (no
+# `queued`/`skipped` run object at all, observed twice on PR#1959 within 35
+# minutes), which silently strands the design<->product loop at whichever hop
+# never fired, with no later event guaranteed to retry it. `needs-design-review`
+# mirrors `needs-review`'s shape exactly: set unconditionally, independent of
+# whether the enqueue step below actually succeeds, whenever this workflow
+# means to hand the PR to someone (product for the first look, designer for a
+# revision, reviewer once product signs off); cleared only once that someone
+# actually acts (agent/roles/product.md, designer.md, reviewer.md). Its
+# presence on a `synchronize` event — even with `design-changes-requested`
+# absent — means the very first `opened` dispatch never landed, so that path
+# now also re-enqueues product instead of silently no-oping forever. A dropped
+# dispatch with no later PR event at all (the designer/reviewer hops, which
+# aren't followed by a guaranteed push) has no in-workflow retry — that's
+# `_check_stalled_pr`'s job (services/telegram-webhook/handler.py), which now
+# reads this same label state to nudge the correct role instead of always
+# nudging `reviewer`.
+name: design-review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: read
+  pull-requests: write
+
+concurrency:
+  group: design-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'synchronize' && 'sync' || github.event.action == 'labeled' && format('labeled-{0}', github.event.label.name) || github.event.action }}
+  cancel-in-progress: true
+
+jobs:
+  enqueue:
+    runs-on: ondemand-x86_64
+    if: startsWith(github.event.pull_request.head.ref, 'design/')
+    steps:
+      - name: Decide what (if anything) to enqueue
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          case "$EVENT_ACTION" in
+            opened|reopened|ready_for_review)
+              echo "target=product" >> "$GITHUB_OUTPUT"
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              ;;
+            labeled)
+              if [[ "$LABEL_NAME" == "design-changes-requested" ]]; then
+                echo "target=designer" >> "$GITHUB_OUTPUT"
+                echo "run=true" >> "$GITHUB_OUTPUT"
+              elif [[ "$LABEL_NAME" == "design-approved" ]]; then
+                echo "target=reviewer" >> "$GITHUB_OUTPUT"
+                echo "run=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "run=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            synchronize)
+              # Same gate shape as request-review.yml's own synchronize
+              # handling: only re-enqueue if product is mid-review-cycle
+              # (label still present), not on every incidental push.
+              # `needs-design-review` (#1962) covers a second case
+              # `design-changes-requested` can't: the very first `opened`
+              # dispatch to product was silently dropped and nothing revised
+              # anything yet, so `design-changes-requested` was never set —
+              # its absence alone used to mean this synchronize path had
+              # nothing to key a re-enqueue off. `needs-design-review` stays
+              # set until product actually reviews, so its presence here
+              # (even alone) means product still hasn't looked at it.
+              LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")')
+              echo "Current labels: ${LABELS}" >&2
+              if [[ ",${LABELS}," == *",design-changes-requested,"* || ",${LABELS}," == *",needs-design-review,"* ]]; then
+                echo "target=product" >> "$GITHUB_OUTPUT"
+                echo "run=true" >> "$GITHUB_OUTPUT"
+              else
+                echo "run=false" >> "$GITHUB_OUTPUT"
+              fi
+              ;;
+            *)
+              echo "run=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+      - name: Mark PR as awaiting a design-loop hop
+        if: |
+          contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action) ||
+          (github.event.action == 'labeled' && contains(fromJSON('["design-changes-requested", "design-approved"]'), github.event.label.name))
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        # Set independently of whether the enqueue step below actually
+        # succeeds — this label is the fallback signal for when it doesn't
+        # (#1962, mirroring request-review.yml's `needs-review` from #673).
+        # Cleared only once whoever this hop is for (product/designer/
+        # reviewer) actually acts (agent/roles/product.md, designer.md,
+        # reviewer.md) — not by this workflow.
+        run: |
+          gh label create needs-design-review --repo "$REPO" --color b60205 \
+            --description "design/** PR has a pending design-loop hop (review/revision/merge) with no confirmed dispatch yet" \
+            --force
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-design-review
+
+      - name: Look up the parent issue, if the PR names one
+        id: issue
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          BODY=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json body --jq '.body // ""')
+          ISSUE_NUM=$(grep -ioP '\b(?:closes|close|closed|fixes|fix|fixed|resolves|resolve|resolved)\s+#\K[0-9]+' <<< "$BODY" | head -n1 || true)
+          echo "number=${ISSUE_NUM}" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Enqueue job
+        if: steps.gate.outputs.run == 'true'
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          TARGET: ${{ steps.gate.outputs.target }}
+          ISSUE_NUM: ${{ steps.issue.outputs.number }}
+        # chat_id must match var.ceo_chat_ids in infra/variables.tf — GitHub
+        # Actions has no read access to Terraform state, so this list is
+        # kept in sync by hand (same note as request-review.yml/
+        # label-enforcer.yml).
+        run: |
+          ISSUE_REF=""
+          if [[ -n "$ISSUE_NUM" ]]; then
+            ISSUE_REF=" for issue #${ISSUE_NUM}"
+          fi
+
+          case "$TARGET" in
+            product)
+              CTX="Review design PR #${PR_NUMBER}${ISSUE_REF}: ${PR_TITLE}. If satisfied the work is complete, add label \`design-approved\`. If not, post specific revision comments and add label \`design-changes-requested\`."
+              ;;
+            designer)
+              CTX="Revise design PR #${PR_NUMBER}${ISSUE_REF}: ${PR_TITLE} per product's review comments — read the PR discussion thread for specifics, push fixes to this same branch."
+              ;;
+            reviewer)
+              CTX="Review PR #${PR_NUMBER}: ${PR_TITLE}"
+              ;;
+          esac
+
+          BODY=$(jq -n \
+            --arg role "$TARGET" \
+            --arg ctx "$CTX" \
+            '{role: $role, context: $ctx, chat_id: "1952896608,5209713934", depth: 1}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
