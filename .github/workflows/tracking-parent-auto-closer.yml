@@ -1,0 +1,179 @@
+# platform#561, part 2/3 (platform#564). #563 shipped `decideClose()` (a
+# pure function over a sub-issues list + hold-label flag) plus its fixture
+# test — this workflow is the live entrypoint that calls it.
+#
+# GitHub's native Sub-issues REST API is both the candidate-parent-discovery
+# and the enumeration mechanism, so there's no timeline/regex scanning here
+# (that was the superseded first design, see #561's 2026-07-11 15:40:40/
+# 15:45:22 comments): `GET /repos/{owner}/{repo}/issues/{n}/parent` on the
+# just-closed issue resolves its tracking parent (404 -> no parent, exit
+# clean); `GET .../sub_issues` on that parent returns the full enumerated
+# list decideClose() decides against. A parent object only ever has one
+# parent (confirmed against the live API, not assumed), so there's no
+# multi-candidate loop like the old design needed.
+#
+# Same shape as issue-close-enforcer.yml: `issues: closed` trigger, no
+# python3 on the self-hosted runner (`infra/ci_runner_bootstrap.sh.tftpl`),
+# heredoc'd Node. Unlike issue-close-enforcer.yml this step does need
+# `actions/checkout` (matching sync-governance-workflows.yml's pattern) so
+# the heredoc can `require()` #563's `scripts/tracking-parent-auto-closer.cjs`
+# instead of re-implementing decideClose() inline.
+#
+# Cross-repo tracking parents are supported by the API (same owner, not
+# same repo) but this workflow only ever runs with `github.token`, which
+# GitHub Actions scopes to the repo the workflow runs in — it cannot read
+# or write a parent living in a different repo. When that happens the `gh
+# api`/`gh issue close` calls below simply fail with 403/404 and the step
+# logs a warning and exits clean rather than red-failing the run: there is
+# no fix available from inside this workflow (a broader-scoped token is a
+# separate, larger decision, out of #564's scope) so failing loud here
+# would just be permanent noise, not an actionable signal.
+#
+# platform#1064: a *readable* cross-repo parent with unreadable cross-repo
+# children is a different, sneakier failure than the 403/404 above — the
+# REST `sub_issues` endpoint silently omits children the token can't read
+# instead of erroring, so `fetchAllSubIssues()` can return a truncated-but-
+# successful list and wrongly look complete. GraphQL's `subIssuesSummary.
+# total` on the parent returns the true linked count regardless of
+# cross-repo read access, so it's fetched here purely to sanity-check the
+# REST list's length before trusting it — `decideClose()` fails safe (logs
+# a warning, leaves the parent open) if the two don't match.
+#
+# Generic (not platform-only) — no denylist entry needed in
+# bootstrap-product-repo.sh, this backfills to every product repo the same
+# way closing-keyword-check.yml / issue-close-enforcer.yml did.
+name: tracking-parent-auto-closer
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: read
+
+concurrency:
+  group: tracking-parent-auto-closer-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  auto-close:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for a tracking parent and auto-close it if every sub-issue is closed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          cat > /tmp/tracking-parent-auto-closer.js <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+          const { decideClose } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-auto-closer.cjs');
+
+          const REPO = process.env.REPO;
+          const ISSUE_NUMBER = process.env.ISSUE_NUMBER;
+
+          function fetchAllSubIssues(ownerRepo, number) {
+            const issues = [];
+            let page = 1;
+            for (;;) {
+              const out = execFileSync('gh', [
+                'api',
+                `repos/${ownerRepo}/issues/${number}/sub_issues`,
+                '-X', 'GET',
+                '-f', 'per_page=100',
+                '-f', `page=${page}`,
+              ], { encoding: 'utf8' });
+              const batch = JSON.parse(out);
+              issues.push(...batch);
+              if (batch.length < 100) break;
+              page += 1;
+            }
+            return issues;
+          }
+
+          function fetchExpectedTotal(ownerRepo, number) {
+            const [owner, repo] = ownerRepo.split('/');
+            const query = 'query($owner:String!,$repo:String!,$number:Int!){ ' +
+              'repository(owner:$owner,name:$repo){ issue(number:$number){ ' +
+              'subIssuesSummary { total } } } }';
+            const out = execFileSync('gh', [
+              'api', 'graphql',
+              '-f', `query=${query}`,
+              '-f', `owner=${owner}`,
+              '-f', `repo=${repo}`,
+              '-F', `number=${number}`,
+            ], { encoding: 'utf8' });
+            return JSON.parse(out).data.repository.issue.subIssuesSummary.total;
+          }
+
+          let parent;
+          try {
+            const out = execFileSync('gh', ['api', `repos/${REPO}/issues/${ISSUE_NUMBER}/parent`], { encoding: 'utf8' });
+            parent = JSON.parse(out);
+          } catch (e) {
+            console.log(`#${ISSUE_NUMBER} has no parent issue — nothing to do.`);
+            process.exit(0);
+          }
+
+          const parentRepo = parent.repository && parent.repository.full_name;
+          const parentNumber = parent.number;
+          if (!parentRepo || !parentNumber) {
+            console.log('::warning::Parent response missing repository/number fields — nothing to do.');
+            process.exit(0);
+          }
+
+          if (parent.state === 'closed') {
+            console.log(`Parent ${parentRepo}#${parentNumber} is already closed — nothing to do.`);
+            process.exit(0);
+          }
+
+          const hasHoldLabel = Array.isArray(parent.labels) &&
+            parent.labels.some((l) => l.name === 'tracking-parent-hold');
+
+          let subIssues;
+          try {
+            subIssues = fetchAllSubIssues(parentRepo, parentNumber);
+          } catch (e) {
+            console.log(`::warning::Could not fetch sub-issues for parent ${parentRepo}#${parentNumber} ` +
+              `(likely a cross-repo token scope limit — see this workflow's header comment) — nothing done.`);
+            process.exit(0);
+          }
+
+          let expectedTotal;
+          try {
+            expectedTotal = fetchExpectedTotal(parentRepo, parentNumber);
+          } catch (e) {
+            console.log(`::warning::Could not verify the true sub-issue total for parent ` +
+              `${parentRepo}#${parentNumber} via GraphQL, so the fetched list's completeness ` +
+              `can't be confirmed — nothing done.`);
+            process.exit(0);
+          }
+
+          const { shouldClose, reason } = decideClose(subIssues, hasHoldLabel, expectedTotal);
+          console.log(`decideClose(${parentRepo}#${parentNumber}): shouldClose=${shouldClose} — ${reason}`);
+
+          if (!shouldClose) process.exit(0);
+
+          const closedList = subIssues.map((i) => '#' + i.number).join(', ');
+          const commentBody = `All linked sub-issue(s) verified closed via the native sub-issues API: ${closedList}. ` +
+            'Auto-closed by tracking-parent-auto-closer.yml (platform#561).';
+
+          try {
+            execFileSync('gh', [
+              'issue', 'close', String(parentNumber),
+              '--repo', parentRepo,
+              '--comment', commentBody,
+            ], { stdio: 'inherit' });
+            console.log(`Closed ${parentRepo}#${parentNumber}.`);
+          } catch (e) {
+            console.log(`::warning::Found ${parentRepo}#${parentNumber} closeable but could not close it ` +
+              `(likely a cross-repo token scope limit — see this workflow's header comment).`);
+            process.exit(0);
+          }
+          NODE_EOF
+          node /tmp/tracking-parent-auto-closer.js
