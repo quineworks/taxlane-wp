@@ -1,0 +1,217 @@
+# tax-app#103/#104: work was merged (tax-app PRs #107/#111, 2026-07-11) but
+# the referenced issues never auto-closed because the merging PR's body used
+# no GitHub closing keyword (Closes/Fixes/Resolves #NNN). The CEO caught it
+# by hand-eyeballing `gh issue list` after being told "no open issues" — a
+# recurring gap tracked as #522. This is the preventive half of the fix: a
+# blocking check that catches the gap before merge, when it's cheapest to
+# fix. `issue-close-enforcer.yml` is the post-merge safety net for anything
+# that slips past this anyway (squash-merge edge cases, a renamed default
+# branch, etc.).
+#
+# Same trigger shape as `no-security-theater.yml`/`request-review.yml`: no
+# checkout needed, reads straight off `github.event.pull_request.title`/
+# `.body`. Runner is Al2023 arm64 self-hosted with node/jq/gh/aws, no
+# python3 (`infra/ci_runner_bootstrap.sh.tftpl`) — the text parsing below is
+# a heredoc'd Node script, not Python.
+#
+# Logic: strip fenced/inline code so example text in a PR description isn't
+# misread, then pull out bare `#NNN` same-repo references and true
+# `owner/repo#NNN` cross-repo references (skipping refs immediately preceded
+# by "PR"/"pull request", and skipping a bare `reponame#NNN` naming a
+# different repo — see `extractCandidateNumbers()` below). Each remaining
+# candidate is resolved via `gh api repos/{owner}/{repo}/issues/{n}`: if
+# it's actually a PR (`.pull_request` non-null) or the lookup fails
+# (404/403/otherwise), skip it — resolution failures fail open, since the
+# post-merge net is the backstop, not this check. Every confirmed issue
+# number must then be covered by either a closing-keyword clause
+# (`Closes`/`Fixes`/`Resolves #NNN` or `.../owner/repo#NNN`, comma/`and`-
+# joined lists included, per GitHub's own syntax) or an explicit
+# non-closing marker phrase (`Related to`/`Refs`/`Part of`/`See`/
+# `Contributes to`/`Tracked by #NNN`) — the escape hatch for a PR that
+# deliberately doesn't close what it mentions. Anything left uncovered
+# fails the check with an `::error::` naming the number(s).
+#
+# #1069 token-scope decision: cross-repo resolution below still runs with
+# this job's default, repo-scoped `github.token` — deliberately NOT widened
+# to the org-wide `quineworks/github-token` PAT that `sync-governance-
+# workflows.yml` reads via `github_actions_platform_read_github_token`
+# (infra/github.tf). That PAT has write access across every quineworks/*
+# repo; this job triggers on every `pull_request` event in every repo it's
+# propagated into (`scripts/bootstrap-product-repo.sh`, unlike
+# sync-governance-workflows.yml which only ever runs on a push to platform's
+# own protected main and is excluded from propagation). Holding an org-wide
+# write-capable credential in a job with that much larger and more
+# frequently-triggered surface is a disproportionate blast-radius increase
+# for what is a read-only, lint-shaped check — see the option-(b) reasoning
+# in #1069 and the PR that landed this. Every quineworks/* repo is currently
+# private, so `github.token` (scoped only to the repo this job runs in)
+# can't read a sibling repo's issues today; every cross-repo lookup below
+# 404s/403s and falls through the existing fail-open path, same as an
+# unresolvable same-repo number. That's accepted, not a bug: the validation
+# logic runs uniformly regardless, so it starts enforcing for real the
+# moment a referenced repo becomes readable (e.g. made public, or a future
+# narrowly-scoped read-only cross-repo credential is minted for this job
+# specifically) — no code change needed then, just a grant.
+name: closing-keyword-check
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+
+permissions:
+  contents: read
+  issues: read
+
+concurrency:
+  group: closing-keyword-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ondemand-x86_64
+    steps:
+      - name: Check for a closing keyword or an explicit non-closing marker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          cat > /tmp/closing-keyword-check.js <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+
+          const REPO = process.env.REPO;
+          const CURRENT_REPO = REPO && REPO.includes('/') ? REPO.split('/')[1] : REPO;
+          const text = `${process.env.PR_TITLE || ''}\n${process.env.PR_BODY || ''}`;
+
+          function stripCode(t) {
+            return t
+              .replace(/```[\s\S]*?```/g, ' ')
+              .replace(/`[^`]*`/g, ' ');
+          }
+
+          const stripped = stripCode(text);
+
+          // --- verbatim copy of scripts/closing-keyword-utils.cjs (#1069) ---
+          // Bare #NNN same-repo references plus owner/repo#NNN true
+          // cross-repo references, skipping "PR #NNN" / "pull request #NNN".
+          // A reponame#NNN (no owner) is only a same-repo self-reference
+          // (needs coverage) when reponame matches this repo; otherwise it's
+          // an ambiguous mention that isn't valid GitHub cross-repo syntax
+          // (no owner) and is skipped, same as before (#608).
+          function extractCandidateNumbers(s, currentRepo) {
+            const sameRepo = new Set();
+            const crossRepo = new Map();
+            const re = /#(\d+)/g;
+            let m;
+            while ((m = re.exec(s)) !== null) {
+              const before = s.slice(0, m.index);
+              const wordMatch = before.match(/[A-Za-z0-9_.\-/]*$/);
+              const word = wordMatch ? wordMatch[0] : '';
+              const context = before.slice(-20).trimEnd();
+              if (/\b(pull request|pr)\s*$/i.test(context)) continue;
+
+              if (word.includes('/')) {
+                const slash = word.lastIndexOf('/');
+                const owner = word.slice(0, slash);
+                const repo = word.slice(slash + 1);
+                if (!owner || !repo) continue; // malformed (e.g. a leading '/') — skip.
+                const key = `${owner}/${repo}`.toLowerCase();
+                if (!crossRepo.has(key)) crossRepo.set(key, new Set());
+                crossRepo.get(key).add(Number(m[1]));
+                continue;
+              }
+
+              if (word && currentRepo && word.toLowerCase() !== currentRepo.toLowerCase()) {
+                continue; // reponame#NNN naming a different repo — ambiguous shorthand, skip (#608).
+              }
+              sameRepo.add(Number(m[1]));
+            }
+            return { sameRepo, crossRepo };
+          }
+
+          // Returns which reference numbers a keyword pattern covers, in the
+          // same { sameRepo, crossRepo } shape as extractCandidateNumbers().
+          function collectCovered(s, keywordPattern) {
+            const sameRepo = new Set();
+            const crossRepo = new Map();
+            const re = new RegExp(keywordPattern.source, keywordPattern.flags);
+            let m;
+            while ((m = re.exec(s)) !== null) {
+              const listRe = /(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#(\d+)/g;
+              let nm;
+              while ((nm = listRe.exec(m[2])) !== null) {
+                if (nm[1]) {
+                  const key = nm[1].toLowerCase();
+                  if (!crossRepo.has(key)) crossRepo.set(key, new Set());
+                  crossRepo.get(key).add(Number(nm[2]));
+                } else {
+                  sameRepo.add(Number(nm[2]));
+                }
+              }
+            }
+            return { sameRepo, crossRepo };
+          }
+
+          const REF_ITEM = '(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\\d+';
+          const REF_LIST = `(?:${REF_ITEM}(?:\\s*,\\s*|\\s+and\\s+|\\s*&\\s*)?)+`;
+          const CLOSING_KEYWORD = new RegExp(`\\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\b\\s*:?\\s*(${REF_LIST})`, 'gi');
+          const NON_CLOSING_MARKER = new RegExp(`\\b(related to|refs?|part of|see|contributes? to|tracked by)\\b\\s*:?\\s*(${REF_LIST})`, 'gi');
+          // --- end verbatim copy ---
+
+          const candidates = extractCandidateNumbers(stripped, CURRENT_REPO);
+          const closing = collectCovered(stripped, CLOSING_KEYWORD);
+          const marker = collectCovered(stripped, NON_CLOSING_MARKER);
+
+          const confirmedIssues = [];
+          for (const n of candidates.sameRepo) {
+            let data;
+            try {
+              const out = execFileSync('gh', ['api', `repos/${REPO}/issues/${n}`], { encoding: 'utf8' });
+              data = JSON.parse(out);
+            } catch (e) {
+              continue; // unresolved (404 or otherwise) -> fail open.
+            }
+            if (data.pull_request) continue; // it's a PR reference, not an issue.
+            confirmedIssues.push(n);
+          }
+
+          const uncovered = confirmedIssues
+            .filter((n) => !closing.sameRepo.has(n) && !marker.sameRepo.has(n))
+            .map((n) => '#' + n);
+
+          // #1069: true cross-repo (owner/repo#NNN) candidates — see the
+          // token-scope note at the top of this file for why this still
+          // uses github.token, not a wider PAT.
+          for (const [key, numbers] of candidates.crossRepo) {
+            const coveredClosing = closing.crossRepo.get(key) || new Set();
+            const coveredMarker = marker.crossRepo.get(key) || new Set();
+            for (const n of numbers) {
+              if (coveredClosing.has(n) || coveredMarker.has(n)) continue;
+              let data;
+              try {
+                const out = execFileSync('gh', ['api', `repos/${key}/issues/${n}`], { encoding: 'utf8' });
+                data = JSON.parse(out);
+              } catch (e) {
+                continue; // unresolved (404/403/otherwise) -> fail open, same as same-repo.
+              }
+              if (data.pull_request) continue; // it's a PR reference, not an issue.
+              uncovered.push(`${key}#${n}`);
+            }
+          }
+
+          if (uncovered.length > 0) {
+            const list = uncovered.join(', ');
+            console.log(
+              `::error::This PR references issue(s) ${list} without a closing keyword ` +
+              `(Closes/Fixes/Resolves #NNN) and without an explicit non-closing marker ` +
+              `(Related to/Refs/Part of/See/Contributes to/Tracked by #NNN). Add one of these ` +
+              `to the PR title or body, or the merged PR will leave the issue open (see #522).`
+            );
+            process.exit(1);
+          }
+
+          console.log('All referenced issues are covered by a closing keyword or an explicit non-closing marker.');
+          NODE_EOF
+          node /tmp/closing-keyword-check.js
