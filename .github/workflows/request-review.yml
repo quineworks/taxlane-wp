@@ -1,0 +1,138 @@
+# Every opened PR automatically dispatches a reviewer agent via the work
+# queue. The reviewer merges or requests changes — no human in the loop.
+#
+# Also triggers on `synchronize` (a push to the PR branch) and `edited`
+# (a title/body edit — e.g. an agent patching the PR description via the
+# REST API instead of pushing a commit, which doesn't move the branch head
+# and so never fires `synchronize`; see #425), but only enqueues a re-review
+# when the PR carries the `changes-requested` OR `needs-review` label: the
+# reviewer agent doesn't file formal GitHub reviews (gh pr review) — all
+# agents share one GitHub account, so GitHub's reviewDecision never
+# populates — it posts an issue/PR comment. An earlier version of this gate
+# tried to infer state by regex-matching the last verdict comment's wording
+# (e.g. "Request changes"), but the reviewer's phrasing isn't a fixed
+# contract (a natural rewording like "## Review: request changes" silently
+# defeated the regex — see #40) and the LLM composing that comment has no
+# reason to know a workflow parses it. The labels are signals the reviewer
+# sets/clears explicitly (agent/roles/reviewer.md) and are far cheaper to
+# keep in sync than freeform text. `changes-requested` distinguishes "fix
+# pushed after changes requested" from "PR still being drafted before its
+# first review" or "already merged/approved". `needs-review` closes a
+# separate gap (#673): it's set on every opened/reopened/ready_for_review
+# event regardless of whether the enqueue below actually succeeds, and only
+# cleared once the reviewer posts a verdict of any kind. If the initial
+# `opened` dispatch is ever lost (Actions delivery miss, enqueue step
+# failure), `needs-review` stays set, so the next `synchronize`/`edited`
+# push still re-enqueues instead of silently no-oping forever (PR#671 sat
+# unreviewed for 20+ minutes before this existed).
+# Without this gate, a depth-2 agent addressing feedback has no way to
+# summon a re-review (delegating a reviewer job would be depth 3, refused by
+# the dispatcher) and the loop dead-ends without a human/operator bridging
+# it (see #13).
+#
+# `concurrency` collapses back-to-back `synchronize` pushes (e.g. a
+# multi-commit fix) into one enqueue for the latest SHA instead of one
+# reviewer job per push. The group is keyed on event type too, so a fast
+# follow-up push can't cancel an in-flight opened/reopened/ready_for_review
+# run before its enqueue step sends the SQS message (that run is what gets
+# the PR its first review at all).
+name: request-review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, edited]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: request-review-${{ github.event.pull_request.number }}-${{ github.event.action == 'synchronize' && 'sync' || github.event.action }}
+  cancel-in-progress: true
+
+jobs:
+  enqueue:
+    runs-on: ondemand-x86_64
+    steps:
+      - name: Decide whether this push needs a re-review
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_ACTION: ${{ github.event.action }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if [[ "$EVENT_ACTION" != "synchronize" && "$EVENT_ACTION" != "edited" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # synchronize and edited share this label-gated path (as opposed to
+          # opened/reopened/ready_for_review above, which always enqueue —
+          # there's no prior review to react to yet). The reviewer adds
+          # `changes-requested` when its verdict is Request changes, and
+          # clears both `changes-requested` and `needs-review` on any verdict
+          # (Merge/Request changes/Escalate) — see agent/roles/reviewer.md.
+          # `needs-review` is set unconditionally below on every
+          # opened/reopened/ready_for_review event, so its continued presence
+          # here means the reviewer never posted a first verdict — either
+          # because that earlier enqueue was lost, or a review is still in
+          # flight. Gating on either label's presence is the only signal a
+          # (re-)review is wanted.
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")')
+          echo "Current labels: ${LABELS}" >&2
+
+          if [[ ",${LABELS}," == *",changes-requested,"* || ",${LABELS}," == *",needs-review,"* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Mark PR as awaiting a reviewer verdict
+        if: contains(fromJSON('["opened", "reopened", "ready_for_review"]'), github.event.action)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        # Set independently of whether the enqueue step below actually
+        # succeeds — this label is the fallback signal for when it doesn't
+        # (#673). Only cleared once the reviewer posts a verdict of any kind
+        # (agent/roles/reviewer.md).
+        run: |
+          gh label create needs-review --repo "$REPO" --color b60205 \
+            --description "PR has never received a reviewer verdict; synchronize/edited pushes should re-enqueue" \
+            --force
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label needs-review
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Enqueue reviewer job
+        if: steps.gate.outputs.run == 'true'
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        # chat_id must match var.ceo_chat_ids in infra/variables.tf — GitHub
+        # Actions has no read access to Terraform state, so this list is
+        # kept in sync by hand.
+        #
+        # #1077: this dispatch used to omit the repo entirely ("Review PR
+        # #553: ..."), so a bare PR number with no repo named forced the
+        # reviewer to guess — and since this workflow is propagated verbatim
+        # into every product repo (scripts/bootstrap-product-repo.sh), the
+        # gap existed identically everywhere, not just here. Naming the repo
+        # explicitly removes the ambiguity at the source instead of relying
+        # on the reviewer to infer or search for it.
+        run: |
+          BODY=$(jq -n \
+            --arg ctx "Review PR #${PR_NUMBER} in ${REPO}: ${PR_TITLE}" \
+            '{role: "reviewer", context: $ctx, chat_id: "1952896608,5209713934", depth: 1}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
