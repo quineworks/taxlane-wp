@@ -1,0 +1,171 @@
+# platform#2339 (sub-issue 2 of 3 under #2336): qa-fixtures-run.yml
+# (#2338) runs `render-interact` against a repo's own qa/fixtures.json on
+# every push to main and surfaces PASS/FAIL as its own job status, but
+# nothing woke anyone on a real failure until now — it just sat red like
+# any other job, depending on someone noticing.
+#
+# Deliberately a *scoped sibling* of ci-sentinel.yml rather than adding
+# `qa-fixtures-run` to that workflow's tracked `workflows:` list (option 1
+# from the issue body). Option 1 would route a fixture failure to
+# `role: engineer` for generic triage like every other tracked failure —
+# but a fixture failure is a live-interaction check against the *deployed*
+# UI regressing on a real merge, which is usually a real product
+# regression `qa` should reproduce and fix directly, not something that
+# benefits from an engineer's first-pass triage first. The issue's own
+# definition of done says a failure should "automatically dispatch a `qa`
+# fix task" specifically — option 1 only gets there indirectly (engineer
+# triage that would then have to hand off to qa), so option 2 is chosen
+# here, at the cost of a second small workflow instead of one list entry.
+#
+# Reuses ci-sentinel.yml's own workflow_run -> DynamoDB dedupe-claim ->
+# `aws sqs send-message` pattern verbatim (same table, same role, same
+# queue) rather than inventing a new mechanism, per the issue's own
+# constraint. The dedupe claim uses its own `qa-fixtures-wake-run-*` key
+# prefix (infra/qa_fixtures_wake.tf), not ci-sentinel's `sentinel-run-*`
+# one — a shared prefix would need widening ci-sentinel's own IAM grant
+# past its documented sentinel-only scope for no benefit, and run ids are
+# globally unique across workflows in a repo, so a second prefix can never
+# collide with the first.
+#
+# Not added to ci-sentinel.yml's own `workflows:` list: that would
+# double-dispatch (both this workflow and a widened ci-sentinel firing on
+# the same failed run) — this is deliberately either/or with option 1, not
+# both.
+name: qa-fixtures-wake
+
+on:
+  workflow_run:
+    workflows: [qa-fixtures-run]
+    types: [completed]
+
+permissions:
+  id-token: write
+  contents: read
+  # Needed to fetch the triggering run's own job logs below (render-interact's
+  # PASS/FAIL output) via `gh run view --log-failed` -- ci-sentinel.yml
+  # doesn't need this since it leaves log-fetching to the engineer it wakes.
+  actions: read
+
+jobs:
+  wake:
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Claim this run id (dedupe)
+        id: claim
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set +e
+          OUT=$(aws dynamodb put-item \
+            --table-name quineworks-state \
+            --item "{\"pk\": {\"S\": \"qa-fixtures-wake-run-${RUN_ID}\"}}" \
+            --condition-expression "attribute_not_exists(pk)" 2>&1)
+          STATUS=$?
+          set -e
+
+          if [[ $STATUS -eq 0 ]]; then
+            echo "claimed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$OUT" == *ConditionalCheckFailedException* ]]; then
+            echo "claimed=false" >> "$GITHUB_OUTPUT"
+            echo "Run ${RUN_ID} already claimed — skipping duplicate enqueue" >&2
+          else
+            echo "$OUT" >&2
+            exit "$STATUS"
+          fi
+
+      - name: Enqueue qa fix job
+        if: steps.claim.outputs.claimed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set +e
+          LOG=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>&1)
+          set -e
+          # render-interact (agent/bin/render-interact) logs one PASS:/
+          # RETRY-PASS:/FAIL: line per fixture case, each followed by
+          # zero (PASS/RETRY-PASS) or more (FAIL only) two-space-indented
+          # detail lines (label/expected/scoped/rendered/error). A GitHub
+          # Actions log line is always "<timestamp>Z <content>" with
+          # exactly one separating space, so a FAIL header reads
+          # "...Z FAIL: ..." (one space) while its indented detail reads
+          # "...Z   ..." (that one separator plus the script's own
+          # two-space indent). Matching on that shape, rather than loose
+          # keywords like "expected"/"rendered:", matters: those bare words
+          # also match inside *PASS* lines' own free-text case descriptions
+          # (e.g. "... the payslip-withheld-less-than-expected direction"),
+          # which would waste the size cap below on irrelevant PASS prose
+          # and push genuine FAIL detail out of the capped output entirely
+          # -- caught by replaying the real tax-lane run 36112574515 log
+          # rather than trusting the pattern by inspection
+          # (platform#3130/#3132).
+          #
+          # Capped at 40000 bytes -- comfortably under SQS's 256KB message
+          # limit with room to spare, and ~7x the 5478 bytes the actual
+          # reference run (tax-lane#36112574515, platform#3130/#3132) needed
+          # for its 7 real FAIL cases. A flat byte cap on its own can still
+          # land mid-block on a fixture suite with enough failures, silently
+          # dropping the back half of a real case's detail (or whole cases)
+          # -- caught in review of this fix's first cut, which used
+          # `head -c 4000` and truncated 2 of that same reference run's 7
+          # real FAILs, including a genuine late-payment-receivership
+          # regression, right after claiming "well within the cap" against
+          # that exact run. So truncation here is whole-block: FAIL blocks
+          # (header + indented detail) are accumulated only while they fit
+          # under the cap -- never cut partway through one -- and if any
+          # are left over, a trailing note says how many and points at the
+          # run URL for the rest, rather than silently dropping them.
+          # grep exits 1 on zero matches (e.g. the triggering failure was an
+          # npm ci blip/checkout failure/resolver crash before render-interact
+          # ever ran), which would kill this step under the default set -eo
+          # pipefail and skip the enqueue entirely -- guard it like LOG= above.
+          set +e
+          FAIL_TEXT=$(echo "$LOG" | grep -E 'Z FAIL:|Z {2,}[^ ]')
+          set -e
+          CAP=40000
+
+          if [[ $(wc -c <<< "$FAIL_TEXT") -le $CAP ]]; then
+            QA_OUTPUT="$FAIL_TEXT"
+          else
+            mapfile -t STARTS < <(grep -n 'Z FAIL:' <<< "$FAIL_TEXT" | cut -d: -f1)
+            TOTAL_FAILS=${#STARTS[@]}
+            TOTAL_LINES=$(wc -l <<< "$FAIL_TEXT")
+            QA_OUTPUT=""
+            INCLUDED=0
+            for i in "${!STARTS[@]}"; do
+              START=${STARTS[$i]}
+              if [[ $((i + 1)) -lt $TOTAL_FAILS ]]; then
+                END=$(( STARTS[i + 1] - 1 ))
+              else
+                END=$TOTAL_LINES
+              fi
+              BLOCK=$(sed -n "${START},${END}p" <<< "$FAIL_TEXT")
+              CANDIDATE="${QA_OUTPUT}${BLOCK}"$'\n'
+              if [[ $(wc -c <<< "$CANDIDATE") -gt $CAP && $INCLUDED -gt 0 ]]; then
+                break
+              fi
+              QA_OUTPUT="$CANDIDATE"
+              INCLUDED=$((INCLUDED + 1))
+            done
+            REMAINING=$((TOTAL_FAILS - INCLUDED))
+            if [[ $REMAINING -gt 0 ]]; then
+              QA_OUTPUT="${QA_OUTPUT}"$'\n'"+${REMAINING} more FAIL case(s) truncated, see run URL for full list."
+            fi
+          fi
+
+          BODY=$(jq -n \
+            --arg ctx "qa-fixtures-run failed on ${REPO}@${BRANCH} (${HEAD_SHA:0:7}) — a live render-interact check against this repo's qa/fixtures.json regressed on a real merge to main. Run: ${RUN_URL}. render-interact output: ${QA_OUTPUT}. This is very likely a real product regression: reproduce it against the deployed UI, find the root cause, and ship a fix PR. If the failure turns out to be a stale fixture expectation rather than a real regression, fix qa/fixtures.json instead and say so in your closing report." \
+            '{role: "qa", context: $ctx, chat_id: "1952896608", depth: 0}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
