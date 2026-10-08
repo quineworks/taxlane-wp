@@ -1,0 +1,104 @@
+# platform#3253: a self-healing backstop for the `tracking-parent-hold`
+# bypass pattern — an agent closes a held tracking parent directly instead
+# of letting `tracking-parent-auto-closer.yml` do it, sometimes stripping
+# the hold label in the same action. This has recurred three times (#1121,
+# tax-lane#820/#838, tax-lane#2547) despite a prompt guardrail in
+# `manager.md`/`reviewer.md` (#1804) — prose doesn't reliably survive a
+# long/multi-step agent run, so this doesn't depend on the dispatched agent
+# remembering/following it.
+#
+# Additive only: this never touches `tracking-parent-auto-closer.yml` or its
+# script, it only guards against bypassing it. `decideBypass()`
+# (`scripts/tracking-parent-hold-guard.cjs`) needs no Sub-issues API call —
+# `tracking-parent-hold` is, by convention, applied exclusively to tracking
+# parents, so the closed issue's own label history (via the Issue Events
+# API) is sufficient to tell a bypass from a legitimate close.
+#
+# Same shape as `tracking-parent-auto-closer.yml`: `issues: closed` trigger,
+# no python3 on the self-hosted runner
+# (`infra/ci_runner_bootstrap.sh.tftpl`), heredoc'd Node requiring the
+# fixture-tested pure function rather than reimplementing it inline.
+#
+# `tracking-parent-auto-closer.yml`'s own closes always run under
+# `github.token`, so they show up as actor `github-actions[bot]` —
+# `decideBypass()` treats that actor as always legitimate and short-circuits
+# before looking at label history, so this guard can never fight the
+# auto-closer it's meant to protect.
+name: tracking-parent-hold-guard
+
+on:
+  issues:
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: tracking-parent-hold-guard-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect and self-heal a tracking-parent-hold bypass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          CLOSED_AT: ${{ github.event.issue.closed_at }}
+          CLOSED_BY: ${{ github.event.sender.login }}
+        run: |
+          cat > /tmp/tracking-parent-hold-guard.js <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+          const { decideBypass } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-hold-guard.cjs');
+
+          const REPO = process.env.REPO;
+          const ISSUE_NUMBER = process.env.ISSUE_NUMBER;
+          const CLOSED_AT = process.env.CLOSED_AT;
+          const CLOSED_BY = process.env.CLOSED_BY;
+
+          function fetchAllEvents(ownerRepo, number) {
+            const events = [];
+            let page = 1;
+            for (;;) {
+              const out = execFileSync('gh', [
+                'api',
+                `repos/${ownerRepo}/issues/${number}/events`,
+                '-X', 'GET',
+                '-f', 'per_page=100',
+                '-f', `page=${page}`,
+              ], { encoding: 'utf8' });
+              const batch = JSON.parse(out);
+              events.push(...batch);
+              if (batch.length < 100) break;
+              page += 1;
+            }
+            return events;
+          }
+
+          const events = fetchAllEvents(REPO, ISSUE_NUMBER);
+          const { isBypass, reason } = decideBypass({ events, closedAt: CLOSED_AT, closedByLogin: CLOSED_BY });
+          console.log(`decideBypass(${REPO}#${ISSUE_NUMBER}): isBypass=${isBypass} — ${reason}`);
+
+          if (!isBypass) process.exit(0);
+
+          execFileSync('gh', ['issue', 'reopen', ISSUE_NUMBER, '--repo', REPO], { stdio: 'inherit' });
+          execFileSync('gh', ['issue', 'edit', ISSUE_NUMBER, '--repo', REPO, '--add-label', 'tracking-parent-hold'], { stdio: 'inherit' });
+
+          const commentBody = '🔒 **tracking-parent-hold bypass detected and reverted.** ' + reason + ' ' +
+            'Reopening and restoring `tracking-parent-hold` automatically — see platform#3253 (this exact ' +
+            'pattern recurred three times before a prompt-only guardrail proved insufficient). This is not a ' +
+            'judgment call on whether the tracking parent\'s definition of done is actually met: if it is, ' +
+            'remove `tracking-parent-hold` and let `tracking-parent-auto-closer.yml` verify and close it; if ' +
+            'closing now is still correct despite that, do not just close it directly again — this guard will ' +
+            'revert the same bypass pattern every time.';
+
+          execFileSync('gh', ['issue', 'comment', ISSUE_NUMBER, '--repo', REPO, '--body', commentBody], { stdio: 'inherit' });
+          console.log(`Reverted bypass close on ${REPO}#${ISSUE_NUMBER}.`);
+          NODE_EOF
+          node /tmp/tracking-parent-hold-guard.js
