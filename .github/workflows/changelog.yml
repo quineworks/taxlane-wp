@@ -1,0 +1,401 @@
+# Deterministic post-merge memory update (issue #51): a merged PR used to
+# become durable company memory only if an agent happened to notice and
+# write it down — ~25 PRs shipped via operator-dispatched engineers before
+# anyone curated them in, and COMPANY.md went stale for hours. This appends
+# one dated line straight to memory/CHANGELOG.md in S3 on every merge to
+# main, no agent involved.
+#
+# Writes to memory/CHANGELOG.md, not memory/COMPANY.md's own Changelog
+# section. COMPANY.md is hand-curated by chief-of-staff/memory-keeper during
+# their runs and synced back wholesale at the end of each run
+# (agent/entrypoint.sh does `aws s3 sync` of the whole memory/ dir) — a
+# workflow write landing mid-run could get clobbered by that sync.
+# CHANGELOG.md is nobody's manual edit target, only this workflow's append
+# target — but until issue #83's fix, entrypoint.sh's push-side sync wasn't
+# excluding it either, so an agent whose boot-time pull predated this
+# workflow's locked append would still clobber it back to a stale copy on
+# teardown (no lock taken on that side, no re-GET before writing).
+# entrypoint.sh now passes --exclude "CHANGELOG.md" on the push sync, so
+# this workflow (lock-guarded) is the only writer left. COMPANY.md links to
+# this file for the raw, guaranteed-current record; its own Changelog
+# section stays the curated narrative CoS actually writes.
+#
+# The workflow_dispatch/backfill job below is the escape hatch for the
+# situation issue #83 itself hit: entries lost to a clobber before the fix
+# landed, needing manual re-insertion at a specific chronological position
+# (not just appended at EOF like a live merge). It reuses the same
+# acquire/release lock steps and the same S3 object, so it's still the one
+# governed writer, not a manual edit path.
+#
+# platform#1239: a PR that's closed(unmerged) and then merged straight from
+# that state (no intervening reopen) never delivers a second `pull_request`
+# webhook at all -- confirmed against PR#1235 via GraphQL timelineItems,
+# which showed ClosedEvent -> MergedEvent with no ReopenedEvent between
+# them, and against the repo-wide Actions log for the merge window, which
+# showed zero pull_request-triggered runs of any kind (only the `push` to
+# `main` fired). So `append` above -- which only listens on
+# `pull_request: types: [closed]` -- can silently never run for a PR merged
+# this way, and there's no pull_request-side trigger that would catch it.
+# `push` to `main` is the one signal that reliably still fires for every
+# merge (it's a different event, keyed off the commit landing, not the PR's
+# open/closed state), so `push-backstop` below re-derives the merged PR(s)
+# for the pushed commit via `GET /repos/{owner}/{repo}/commits/{sha}/pulls`
+# and appends any changelog line `append` hasn't already written. The dedupe
+# check (grep for `(#N)` in the current CHANGELOG.md before appending) makes
+# this a no-op on the normal path, where `append`'s own run already added
+# the line moments earlier.
+#
+# platform#1245: on a normal merge, `push` and `pull_request: closed` both
+# fire for the same commit, and their ordering isn't guaranteed -- the two
+# jobs serialize through the same lock, but whichever runs second was, until
+# this fix, appending unconditionally regardless of what the first one just
+# wrote. `push-backstop` already deduped (it was built to be a no-op on the
+# normal path); `append` didn't, so every ordinary merge where push-backstop
+# happened to win the race got double-appended. `append` now carries the
+# same `(#N)` dedupe check, so whichever job runs second is a no-op either
+# way.
+#
+# platform#1265: the `(#N)` dedupe check above (and the appended line format
+# itself) never carried which repo the PR number belonged to -- every
+# quineworks/* repo's PR numbering starts from 1, so a bare `(#N)` collides
+# constantly across repos. Confirmed against tax-lane#621/#623/#629: each
+# one's `append` and `push-backstop` runs independently downloaded
+# CHANGELOG.md, found a pre-existing `(#621)`/`(#623)`/`(#629)` line (from
+# unrelated platform#621/#623/#629, appended ten days earlier), concluded
+# "the other job already handled it," and both skipped -- silently losing
+# the real tax-lane line with no error, no non-zero exit, nothing for
+# `conclusion: success` to catch. Every appended line and dedupe check now
+# carries the repo name (`(reponame#N)`), so numbers only collide when both
+# the repo and the PR number match, which can't happen.
+#
+# platform#1836: every scratch file below used a hardcoded `/tmp/...` path.
+# The persistent fleet's runners (since migrated off, platform#2262) weren't
+# containerized per job -- `/tmp` was the shared host OS temp dir, not
+# job-scoped -- so two `changelog.yml` runs from *different repos* landing
+# on the same runner at (or near) the same wall-clock moment could stomp
+# each other's `/tmp/prs.json` / `/tmp/CHANGELOG.md` between one job's write
+# and its own later read. `ondemand-x86_64` (this fleet, now) launches a
+# fresh, single-job box per run, so this specific hazard can't recur --
+# `$RUNNER_TEMP` stays the fix below regardless, since relying on a shared
+# host path was always incidental, not something to reintroduce.
+# Confirmed via Actions logs + S3 version history: platform's push-backstop
+# run for PR#1835 (14:50:03-14:50:11 UTC 2026-08-01) wrote a changelog line
+# stamped `(platform#866)` but carrying tax-lane PR#866's title -- its own
+# `Find merged PR(s)` step correctly queried platform's own commit, but by
+# the time the later `Backfill` step read `/tmp/prs.json` back, a
+# concurrently-scheduled tax-lane push-backstop run (queued from the same
+# governance-sync-triggered burst, its own steps interleaved 14:50:03-14:50:08
+# on what must be the same underlying host) had overwritten it. The S3
+# read-modify-write is lock-guarded against this, but the `/tmp/prs.json`
+# write in `Find merged PR(s)` happens *before* the lock is acquired, so nothing
+# guarded it. `$RUNNER_TEMP` is allocated per-job by the runner agent itself
+# (unique directory, cleaned before each job starts) -- switching every
+# scratch path from `/tmp/...` to `$RUNNER_TEMP/...` below removes the shared
+# namespace entirely rather than trying to lock around it.
+name: changelog
+
+on:
+  pull_request:
+    types: [closed]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      line:
+        description: "Exact line to insert, e.g. '- 2026-07-07: Title (#72)'"
+        required: true
+      anchor_after:
+        description: "Substring of the existing line to insert directly after"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: read
+
+jobs:
+  append:
+    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      # Guards the read-modify-write below against two PRs merging close
+      # enough together to race each other (same pattern as ci-sentinel.yml's
+      # dedupe claim). TTL on the lock item means a run that dies mid-hold
+      # doesn't wedge every future merge.
+      - name: Acquire changelog lock
+        id: lock
+        run: |
+          set +e
+          for i in $(seq 1 10); do
+            NOW=$(date -u +%s)
+            TTL=$((NOW + 60))
+            OUT=$(aws dynamodb put-item \
+              --table-name quineworks-state \
+              --item "{\"pk\": {\"S\": \"changelog-lock\"}, \"ttl\": {\"N\": \"${TTL}\"}}" \
+              --condition-expression "attribute_not_exists(pk) OR #ttl < :now" \
+              --expression-attribute-names '{"#ttl": "ttl"}' \
+              --expression-attribute-values "{\":now\": {\"N\": \"${NOW}\"}}" 2>&1)
+            if [[ $? -eq 0 ]]; then
+              echo "acquired=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$OUT" != *ConditionalCheckFailedException* ]]; then
+              echo "$OUT" >&2
+              exit 1
+            fi
+            sleep $(( (RANDOM % 5) + 1 ))
+          done
+          echo "Could not acquire changelog lock after 10 tries" >&2
+          exit 1
+
+      # Dedupe guard: on the platform#1239 backstop path, `push-backstop`
+      # (triggered by this same merge's `push` event, which can fire before
+      # or after this job acquires the lock) may have already written this
+      # PR's line while it held the lock first. Both jobs serialize through
+      # the same lock, but the ordering between them isn't guaranteed, so
+      # whichever runs second must check for an existing `(#N)` line rather
+      # than appending unconditionally (platform#1245 -- this check used to
+      # only exist on the backstop side, so this job always double-wrote
+      # when backstop won the race).
+      - name: Append changelog line
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          REPO: ${{ github.event.repository.name }}
+        run: |
+          DATE=$(date -u +%F)
+          LINE="- ${DATE}: ${PR_TITLE} (${REPO}#${PR_NUMBER})"
+
+          if aws s3 cp s3://quineworks-company-324568509417/memory/CHANGELOG.md $RUNNER_TEMP/CHANGELOG.md 2>$RUNNER_TEMP/dl-err.log; then
+            : # existing file downloaded, append below
+          elif grep -qi "does not exist\|not found\|404" $RUNNER_TEMP/dl-err.log; then
+            echo "# Raw shipped-PR record, auto-appended on every merge to main by .github/workflows/changelog.yml — one line per PR, no agent involved. memory/COMPANY.md's own Changelog section is the curated narrative; chief-of-staff/memory-keeper reconcile it from this file." > $RUNNER_TEMP/CHANGELOG.md
+          else
+            # A real error (permissions, network, etc) — fail loudly rather
+            # than silently overwrite history with a fresh file below.
+            cat $RUNNER_TEMP/dl-err.log >&2
+            exit 1
+          fi
+
+          if grep -qF "(${REPO}#${PR_NUMBER})" $RUNNER_TEMP/CHANGELOG.md; then
+            echo "${REPO}#${PR_NUMBER} already has a changelog line -- push-backstop's run handled it, nothing to append."
+            rm -f $RUNNER_TEMP/changelog-appended-line.txt
+          else
+            echo "$LINE" >> $RUNNER_TEMP/CHANGELOG.md
+            aws s3 cp $RUNNER_TEMP/CHANGELOG.md s3://quineworks-company-324568509417/memory/CHANGELOG.md
+            echo "$LINE" > $RUNNER_TEMP/changelog-appended-line.txt
+          fi
+
+      # Confirms the upload above actually stuck -- guards against issue #83's
+      # failure mode (or any other clobber) recurring silently. Still inside
+      # the lock hold so nothing else can write in between the upload and
+      # this re-download. Skipped when the step above found push-backstop
+      # already wrote the line (nothing was uploaded to verify).
+      - name: Verify append landed
+        run: |
+          if [[ ! -f $RUNNER_TEMP/changelog-appended-line.txt ]]; then
+            echo "Nothing was appended this run -- nothing to verify."
+            exit 0
+          fi
+          LINE=$(cat $RUNNER_TEMP/changelog-appended-line.txt)
+          aws s3 cp s3://quineworks-company-324568509417/memory/CHANGELOG.md $RUNNER_TEMP/CHANGELOG-verify.md
+          if ! grep -qF -- "$LINE" $RUNNER_TEMP/CHANGELOG-verify.md; then
+            echo "FATAL: just-appended line missing from S3 object after upload -- something clobbered it: $LINE" >&2
+            exit 1
+          fi
+
+      - name: Release changelog lock
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          aws dynamodb delete-item \
+            --table-name quineworks-state \
+            --key '{"pk": {"S": "changelog-lock"}}'
+
+  push-backstop:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      # Re-derives the merged PR(s) behind this push directly from the
+      # commit, since the `pull_request` event that normally carries this
+      # information can silently never fire (platform#1239).
+      - name: Find merged PR(s) for the pushed commit
+        id: find-prs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+            --jq '[.[] | select(.merged_at != null) | {number, title}]' > $RUNNER_TEMP/prs.json
+          echo "count=$(jq 'length' $RUNNER_TEMP/prs.json)" >> "$GITHUB_OUTPUT"
+          echo "repo=${{ github.event.repository.name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Acquire changelog lock
+        id: lock
+        if: steps.find-prs.outputs.count != '0'
+        run: |
+          set +e
+          for i in $(seq 1 10); do
+            NOW=$(date -u +%s)
+            TTL=$((NOW + 60))
+            OUT=$(aws dynamodb put-item \
+              --table-name quineworks-state \
+              --item "{\"pk\": {\"S\": \"changelog-lock\"}, \"ttl\": {\"N\": \"${TTL}\"}}" \
+              --condition-expression "attribute_not_exists(pk) OR #ttl < :now" \
+              --expression-attribute-names '{"#ttl": "ttl"}' \
+              --expression-attribute-values "{\":now\": {\"N\": \"${NOW}\"}}" 2>&1)
+            if [[ $? -eq 0 ]]; then
+              echo "acquired=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$OUT" != *ConditionalCheckFailedException* ]]; then
+              echo "$OUT" >&2
+              exit 1
+            fi
+            sleep $(( (RANDOM % 5) + 1 ))
+          done
+          echo "Could not acquire changelog lock after 10 tries" >&2
+          exit 1
+
+      # Dedupe guard: on the normal path, `append` (triggered by this same
+      # merge's `pull_request: closed` event) already wrote the line, so
+      # every PR found above is skipped here and nothing is uploaded --
+      # this only ever writes when `append` provably didn't run.
+      - name: Backfill any changelog line(s) `append` missed
+        if: steps.find-prs.outputs.count != '0'
+        env:
+          REPO: ${{ steps.find-prs.outputs.repo }}
+        run: |
+          rm -f $RUNNER_TEMP/changelog-appended-lines.txt
+
+          if aws s3 cp s3://quineworks-company-324568509417/memory/CHANGELOG.md $RUNNER_TEMP/CHANGELOG.md 2>$RUNNER_TEMP/dl-err.log; then
+            : # existing file downloaded, append below
+          elif grep -qi "does not exist\|not found\|404" $RUNNER_TEMP/dl-err.log; then
+            echo "# Raw shipped-PR record, auto-appended on every merge to main by .github/workflows/changelog.yml — one line per PR, no agent involved. memory/COMPANY.md's own Changelog section is the curated narrative; chief-of-staff/memory-keeper reconcile it from this file." > $RUNNER_TEMP/CHANGELOG.md
+          else
+            cat $RUNNER_TEMP/dl-err.log >&2
+            exit 1
+          fi
+
+          DATE=$(date -u +%F)
+          CHANGED=false
+          while IFS= read -r pr; do
+            NUM=$(echo "$pr" | jq -r '.number')
+            TITLE=$(echo "$pr" | jq -r '.title')
+            if grep -qF "(${REPO}#${NUM})" $RUNNER_TEMP/CHANGELOG.md; then
+              echo "${REPO}#${NUM} already has a changelog line -- append's own run handled it, nothing to backfill."
+              continue
+            fi
+            LINE="- ${DATE}: ${TITLE} (${REPO}#${NUM})"
+            echo "$LINE" >> $RUNNER_TEMP/CHANGELOG.md
+            echo "$LINE" >> $RUNNER_TEMP/changelog-appended-lines.txt
+            CHANGED=true
+          done < <(jq -c '.[]' $RUNNER_TEMP/prs.json)
+
+          if [[ "$CHANGED" == "true" ]]; then
+            aws s3 cp $RUNNER_TEMP/CHANGELOG.md s3://quineworks-company-324568509417/memory/CHANGELOG.md
+          else
+            echo "Nothing to backfill; no-op."
+          fi
+
+      - name: Verify any backfilled line(s) landed
+        if: steps.find-prs.outputs.count != '0'
+        run: |
+          if [[ ! -f $RUNNER_TEMP/changelog-appended-lines.txt ]]; then
+            echo "Nothing was appended this run -- nothing to verify."
+            exit 0
+          fi
+          aws s3 cp s3://quineworks-company-324568509417/memory/CHANGELOG.md $RUNNER_TEMP/CHANGELOG-verify.md
+          while IFS= read -r LINE; do
+            if ! grep -qF -- "$LINE" $RUNNER_TEMP/CHANGELOG-verify.md; then
+              echo "FATAL: just-appended line missing from S3 object after upload -- something clobbered it: $LINE" >&2
+              exit 1
+            fi
+          done < $RUNNER_TEMP/changelog-appended-lines.txt
+
+      - name: Release changelog lock
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          aws dynamodb delete-item \
+            --table-name quineworks-state \
+            --key '{"pk": {"S": "changelog-lock"}}'
+
+  backfill:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Acquire changelog lock
+        id: lock
+        run: |
+          set +e
+          for i in $(seq 1 10); do
+            NOW=$(date -u +%s)
+            TTL=$((NOW + 60))
+            OUT=$(aws dynamodb put-item \
+              --table-name quineworks-state \
+              --item "{\"pk\": {\"S\": \"changelog-lock\"}, \"ttl\": {\"N\": \"${TTL}\"}}" \
+              --condition-expression "attribute_not_exists(pk) OR #ttl < :now" \
+              --expression-attribute-names '{"#ttl": "ttl"}' \
+              --expression-attribute-values "{\":now\": {\"N\": \"${NOW}\"}}" 2>&1)
+            if [[ $? -eq 0 ]]; then
+              echo "acquired=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$OUT" != *ConditionalCheckFailedException* ]]; then
+              echo "$OUT" >&2
+              exit 1
+            fi
+            sleep $(( (RANDOM % 5) + 1 ))
+          done
+          echo "Could not acquire changelog lock after 10 tries" >&2
+          exit 1
+
+      - name: Insert backfill line
+        env:
+          LINE: ${{ inputs.line }}
+          ANCHOR: ${{ inputs.anchor_after }}
+        run: |
+          aws s3 cp s3://quineworks-company-324568509417/memory/CHANGELOG.md $RUNNER_TEMP/CHANGELOG.md
+
+          awk -v line="$LINE" -v anchor="$ANCHOR" '
+            { print }
+            index($0, anchor) { print line }
+          ' $RUNNER_TEMP/CHANGELOG.md > $RUNNER_TEMP/CHANGELOG.new.md
+
+          if ! grep -qF -- "$LINE" $RUNNER_TEMP/CHANGELOG.new.md; then
+            echo "FATAL: insert did not happen (anchor not found?): $ANCHOR" >&2
+            exit 1
+          fi
+
+          mv $RUNNER_TEMP/CHANGELOG.new.md $RUNNER_TEMP/CHANGELOG.md
+          aws s3 cp $RUNNER_TEMP/CHANGELOG.md s3://quineworks-company-324568509417/memory/CHANGELOG.md
+
+      - name: Verify insert landed
+        env:
+          LINE: ${{ inputs.line }}
+        run: |
+          aws s3 cp s3://quineworks-company-324568509417/memory/CHANGELOG.md $RUNNER_TEMP/CHANGELOG-verify.md
+          if ! grep -qF -- "$LINE" $RUNNER_TEMP/CHANGELOG-verify.md; then
+            echo "FATAL: just-inserted line missing from S3 object after upload" >&2
+            exit 1
+          fi
+
+      - name: Release changelog lock
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          aws dynamodb delete-item \
+            --table-name quineworks-state \
+            --key '{"pk": {"S": "changelog-lock"}}'
