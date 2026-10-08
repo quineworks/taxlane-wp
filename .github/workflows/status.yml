@@ -1,0 +1,432 @@
+# platform#1943 (part of the #1938 status-page effort; parallel in
+# structure to changelog.yml, sibling to #1942 which shipped the static
+# `/status` page + hand-seeded `site/public/status.json` this workflow now
+# keeps live going forward).
+#
+# Pure label-event -> status.json derivation logic lives in
+# scripts/status-derive.cjs (tested by scripts/test-status.cjs /
+# status-test.yml — same split as tracking-parent-auto-closer.cjs/.yml);
+# this workflow is the cross-repo fetch + lock + PR-land glue.
+#
+# Runs from all three repos (`platform`, `pouchbooks`, `tax-lane` — a
+# workflow trigger only fires from a copy of the file physically present in
+# the repo the event happens in) since a live incident can be opened in any
+# of them. Two things follow from that:
+#
+# 1. Computing component state correctly (multi-incident overlap: two open
+#    incidents mapping to the same component) needs a live cross-repo read
+#    of every open `live-incident`-labeled issue, not just the one issue
+#    that fired this event — so every run re-queries all three repos rather
+#    than only patching the triggering issue's own row.
+# 2. When this runs *from* pouchbooks/tax-lane, it still has to write
+#    site/public/status.json in *platform*. The default per-run
+#    `github.token` is scoped only to the repo the workflow runs in and
+#    can't do that, so — same pattern sync-governance-workflows.yml/
+#    pouchbooks-feature-drift-check.yml already use for their own
+#    cross-repo writes — this fetches the org-wide `quineworks/github-token`
+#    PAT from Secrets Manager. Unlike those two (platform-only workflows,
+#    scoped to `github_actions_platform`), this one has to assume the
+#    broader `github_actions` role (trusted for repo:quineworks/*:*, see
+#    infra/github.tf's `github_actions_read_github_token` grant) since it
+#    runs from every repo, not just platform.
+#
+# `status.json` lives behind platform's protected main
+# (`main-review-gate` ruleset, `bypass_actors: []`) — a bare Contents-API
+# write straight to main 409s there (scripts/bootstrap-product-repo.sh's
+# own header comment documents hitting the same wall). So this lands
+# changes the way sync-governance-workflows.yml lands governance-file
+# drift: push to a dedicated branch (`status-sync`) and open/reuse a PR on
+# it — request-review.yml already auto-dispatches a reviewer on
+# `pull_request: opened/synchronize`, so this rides the existing
+# review-gate with no new plumbing.
+#
+# Since `status-sync` gets touched far more often than `governance-sync`
+# (every qualifying label event across three repos, not just a platform
+# push touching scripts/workflows), two runs racing each other is a real
+# scenario, not a hypothetical: this reuses changelog.yml's DynamoDB
+# conditional-put lock acquire/release primitive (new key, `status-lock`,
+# infra/status.tf) around the whole read-derive-write, and — the part a
+# lock alone doesn't cover — always reads `status.json` off the *current
+# tip of the status-sync branch* if a PR is already open on it, never off
+# stale main, so back-to-back label events build on each other instead of
+# each independently computing from the same stale base and clobbering the
+# other's diff when they land.
+# platform#2195/PR#2196 hardened issue-close-enforcer.yml's un-retried `gh`
+# calls against transient GitHub API 5xx (same failure class as the
+# review-verdict status POST hardened in #2191/PR#2192); this workflow had
+# the identical gap (`gh label create` here 503'd bare, run 32050090722,
+# 2026-08-17) so it gets the same bounded retry-with-backoff treatment,
+# both in the shell step below and in the Node script's shared `gh()`
+# helper (transient-5xx-only there, so it doesn't slow down the several
+# calls that already use try/catch to mean "expected 404, not found yet").
+name: status
+
+on:
+  issues:
+    types: [labeled, unlabeled, closed, reopened]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+
+concurrency:
+  group: status-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ondemand-x86_64
+    steps:
+      # Self-healing, same pattern as label-enforcer.yml's needs-label /
+      # request-review.yml's needs-review: idempotent (--force), cheap, run
+      # every invocation so all three repos end up carrying the four labels
+      # without a separate one-time provisioning script.
+      #
+      # platform#2550: component:pouchbooks-app/component:pouchbooks-sync
+      # dropped from the set this step ensures, matching their removal from
+      # scripts/status-derive.cjs's COMPONENTS -- a label status-derive.cjs
+      # no longer maps to any component is inert (it just never affects any
+      # component's state), so this is cleanup, not a required fix. Existing
+      # copies of the two labels on already-labeled historical issues are
+      # left alone -- this only stops re-asserting/re-creating them.
+      - name: Ensure the live-incident/component/severity labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
+
+          if ! retry gh label create live-incident --repo "$REPO" --color b60205 \
+            --description "Active, user-facing degradation or outage — status.yml (platform#1943) picks this up automatically" --force; then
+            echo "::error::gh label create live-incident failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          if ! retry gh label create component:quineworks-site --repo "$REPO" --color 5319e7 \
+            --description "Incident affects quineworks.com — status.yml component mapping" --force; then
+            echo "::error::gh label create component:quineworks-site failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          if ! retry gh label create component:taxlane --repo "$REPO" --color 5319e7 \
+            --description "Incident affects TaxLane — status.yml component mapping" --force; then
+            echo "::error::gh label create component:taxlane failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          if ! retry gh label create severity:down --repo "$REPO" --color d93f0b \
+            --description "Full outage, not just degraded — status.yml renders the mapped component(s) as down" --force; then
+            echo "::error::gh label create severity:down failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+
+      # Cheap early-exit before touching AWS/cross-repo APIs: most issue
+      # events on any of the three repos have nothing to do with a live
+      # incident. A labeled/unlabeled event is relevant if the label itself
+      # is live-incident (add or remove), or if a component:*/severity:down
+      # label changed on an issue that currently carries live-incident. A
+      # closed/reopened event is relevant if the issue currently carries
+      # live-incident (labels persist through close/reopen).
+      - name: Decide whether this event needs a status.json recompute
+        id: gate
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          ISSUE_LABELS_JSON: ${{ toJSON(github.event.issue.labels) }}
+        run: |
+          HAS_LIVE_INCIDENT=$(jq -r '[.[] | select(.name == "live-incident")] | length > 0' <<<"$ISSUE_LABELS_JSON")
+
+          if [[ "$EVENT_ACTION" == "labeled" || "$EVENT_ACTION" == "unlabeled" ]]; then
+            if [[ "$LABEL_NAME" == "live-incident" ]]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            elif [[ "$LABEL_NAME" == component:* || "$LABEL_NAME" == "severity:down" ]] && [[ "$HAS_LIVE_INCIDENT" == "true" ]]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            # closed / reopened
+            if [[ "$HAS_LIVE_INCIDENT" == "true" ]]; then
+              echo "run=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "run=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.gate.outputs.run == 'true'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Fetch cross-repo GitHub token
+        if: steps.gate.outputs.run == 'true'
+        # Reads the `github_token` field from the field-scoped secrets
+        # broker (platform#2276, part of the #2261 consolidation) instead of
+        # a direct `aws secretsmanager get-secret-value` against the old
+        # per-secret `quineworks/github-token` -- authorized by
+        # `aws_iam_role_policy.github_actions_invoke_secrets_broker`
+        # (infra/secrets_broker.tf). This file is auto-propagated verbatim
+        # into tax-lane/pouchbooks by sync-governance-workflows.yml, so this
+        # one edit covers all three repos' status.yml -- see #2276.
+        run: |
+          BROKER_RESPONSE=$(curl -fsS \
+            --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+            --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" \
+            -H "x-amz-security-token: ${AWS_SESSION_TOKEN}" \
+            "https://r4c8q4snw0.execute-api.us-east-1.amazonaws.com/secret?field=github_token")
+          GITHUB_PAT=$(jq -r '.value' <<<"$BROKER_RESPONSE")
+          echo "::add-mask::${GITHUB_PAT}"
+          echo "GH_TOKEN=${GITHUB_PAT}" >> "$GITHUB_ENV"
+
+      # Guards the branch read-derive-write below against two of these runs
+      # (from any of the three repos) racing each other — same pattern
+      # changelog.yml uses, new lock key so the two can't contend.
+      - name: Acquire status lock
+        id: lock
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          set +e
+          for i in $(seq 1 10); do
+            NOW=$(date -u +%s)
+            TTL=$((NOW + 60))
+            OUT=$(aws dynamodb put-item \
+              --table-name quineworks-state \
+              --item "{\"pk\": {\"S\": \"status-lock\"}, \"ttl\": {\"N\": \"${TTL}\"}}" \
+              --condition-expression "attribute_not_exists(pk) OR #ttl < :now" \
+              --expression-attribute-names '{"#ttl": "ttl"}' \
+              --expression-attribute-values "{\":now\": {\"N\": \"${NOW}\"}}" 2>&1)
+            if [[ $? -eq 0 ]]; then
+              echo "acquired=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$OUT" != *ConditionalCheckFailedException* ]]; then
+              echo "$OUT" >&2
+              exit 1
+            fi
+            sleep $(( (RANDOM % 5) + 1 ))
+          done
+          echo "Could not acquire status lock after 10 tries" >&2
+          exit 1
+
+      - name: Recompute and land status.json
+        if: steps.gate.outputs.run == 'true'
+        env:
+          TRIGGER_ISSUE_JSON: ${{ toJSON(github.event.issue) }}
+        run: |
+          cat > "$RUNNER_TEMP/status-update.js" <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+          const { deriveStatus, COMPONENTS } = require(process.env.GITHUB_WORKSPACE + '/scripts/status-derive.cjs');
+          const { deriveStatusFeedXml } = require(process.env.GITHUB_WORKSPACE + '/scripts/status-feed-derive.cjs');
+
+          const STATUS_REPO = 'quineworks/platform';
+          const STATUS_FILE = 'site/public/status.json';
+          const STATUS_FEED_FILE = 'site/public/status-feed.xml';
+          const SYNC_BRANCH = 'status-sync';
+          const REPOS = ['quineworks/platform', 'quineworks/tax-lane'];
+
+          // Bounded retry-with-backoff on transient GitHub API 5xx only —
+          // several callers below rely on a thrown error to mean "expected
+          // 404, not found yet" (branch/file doesn't exist), so a 4xx (or
+          // any non-5xx) failure is rethrown immediately, unretried.
+          function gh(args) {
+            for (let attempt = 1; attempt <= 5; attempt += 1) {
+              try {
+                return execFileSync('gh', args, { encoding: 'utf8' });
+              } catch (e) {
+                const transient = /HTTP 5\d\d/.test(String(e.stderr || e.message || ''));
+                if (!transient || attempt === 5) throw e;
+                execFileSync('sleep', [String(attempt * 3)]);
+              }
+            }
+          }
+
+          function componentIdsFromLabels(labels) {
+            return (labels || [])
+              .map((l) => l.name)
+              .filter((name) => name.startsWith('component:'))
+              .map((name) => name.slice('component:'.length));
+          }
+
+          function severityDownFromLabels(labels) {
+            return (labels || []).some((l) => l.name === 'severity:down');
+          }
+
+          function isLiveIncidentFromLabels(labels) {
+            return (labels || []).some((l) => l.name === 'live-incident');
+          }
+
+          // 1. Live cross-repo query: every open issue anywhere that
+          // currently carries live-incident. Computed fresh every run
+          // (rather than incrementally patched) so multi-incident overlap
+          // and reopen/relabel edge cases resolve from reality, not from
+          // hand-tracked state.
+          const openIssues = [];
+          for (const repo of REPOS) {
+            let page = 1;
+            for (;;) {
+              const out = gh([
+                'api', `repos/${repo}/issues`,
+                '-X', 'GET',
+                '-f', 'state=open',
+                '-f', 'labels=live-incident',
+                '-f', 'per_page=100',
+                '-f', `page=${page}`,
+              ]);
+              const batch = JSON.parse(out).filter((i) => !i.pull_request);
+              for (const issue of batch) {
+                openIssues.push({
+                  url: issue.html_url,
+                  title: issue.title,
+                  componentIds: componentIdsFromLabels(issue.labels),
+                  severityDown: severityDownFromLabels(issue.labels),
+                  createdAt: issue.created_at,
+                });
+              }
+              if (batch.length < 100) break;
+              page += 1;
+            }
+          }
+          console.log(`Live open live-incident issues across all three repos: ${openIssues.length}`);
+
+          // 2. The specific issue that fired this run, needed only to cover
+          // the one case the live open-issues query structurally can't: an
+          // issue that is *closed* but carries (or just gained)
+          // live-incident — an ordinary close event (labels persist through
+          // close, so the closing issue still needs its incidents[] entry
+          // resolved with its real closedAt) or a retroactive/historical
+          // labeling of an already-closed incident.
+          const triggerIssueRaw = JSON.parse(process.env.TRIGGER_ISSUE_JSON);
+          const triggerIssue = {
+            url: triggerIssueRaw.html_url,
+            title: triggerIssueRaw.title,
+            componentIds: componentIdsFromLabels(triggerIssueRaw.labels),
+            severityDown: severityDownFromLabels(triggerIssueRaw.labels),
+            isOpen: triggerIssueRaw.state === 'open',
+            isLiveIncident: isLiveIncidentFromLabels(triggerIssueRaw.labels),
+            createdAt: triggerIssueRaw.created_at,
+            closedAt: triggerIssueRaw.closed_at,
+          };
+
+          // 3. Read status.json off the current tip of the sync branch if a
+          // PR is already open on it (not off stale main) so back-to-back
+          // events build on each other instead of clobbering.
+          const existingPr = JSON.parse(gh([
+            'pr', 'list', '--repo', STATUS_REPO, '--head', SYNC_BRANCH,
+            '--state', 'open', '--json', 'number',
+          ]))[0];
+          const readRef = existingPr ? SYNC_BRANCH : 'main';
+
+          let currentContent;
+          try {
+            const fileJson = JSON.parse(gh([
+              'api', `repos/${STATUS_REPO}/contents/${STATUS_FILE}`, '-f', `ref=${readRef}`,
+            ]));
+            currentContent = Buffer.from(fileJson.content, 'base64').toString('utf8');
+          } catch (e) {
+            currentContent = JSON.stringify({ components: COMPONENTS.map((c) => ({ ...c, state: 'operational' })), incidents: [] }, null, 2) + '\n';
+          }
+
+          const existing = JSON.parse(currentContent);
+
+          // 4. Derive the new status.json purely (scripts/status-derive.cjs,
+          // fixture-tested by scripts/test-status.cjs).
+          const now = new Date().toISOString();
+          const derived = deriveStatus({
+            existingIncidents: existing.incidents || [],
+            openIssues,
+            triggerIssue,
+            now,
+          });
+          const newContent = JSON.stringify(derived, null, 2) + '\n';
+
+          // Compare semantically, not by raw text: the hand-seeded
+          // status.json (platform#1942) doesn't use JSON.stringify's own
+          // one-key-per-line formatting, so a raw string comparison would
+          // "detect a change" (and open a spurious PR) on every single run
+          // purely from reformatting, even one that's a true no-op.
+          const normalizedExisting = JSON.stringify(existing, null, 2) + '\n';
+          if (newContent === normalizedExisting) {
+            console.log('status.json unchanged by this event — nothing to land.');
+            process.exit(0);
+          }
+
+          // 4b. Derive the paired status-feed.xml content from the same
+          // `derived` result (scripts/status-feed-derive.cjs, fixture-tested
+          // by scripts/test-status-feed-derive.cjs) so every status.json
+          // write in this run also carries a matching status-feed.xml write
+          // -- feed-drift-check.yml blocks a PR touching one without the
+          // other (scripts/feed-drift-check.cjs's status.json ->
+          // status-feed.xml pair, platform#2121/#2349).
+          const newFeedContent = deriveStatusFeedXml({ incidents: derived.incidents, components: COMPONENTS });
+
+          // 5. Land it: main is protected, so this always goes through the
+          // status-sync branch + PR, same as sync-governance-workflows.yml.
+          let mainSha;
+          try {
+            mainSha = gh(['api', `repos/${STATUS_REPO}/git/ref/heads/${SYNC_BRANCH}`, '--jq', '.object.sha']).trim();
+          } catch (e) {
+            mainSha = gh(['api', `repos/${STATUS_REPO}/git/ref/heads/main`, '--jq', '.object.sha']).trim();
+            gh(['api', '-X', 'POST', `repos/${STATUS_REPO}/git/refs`, '-f', `ref=refs/heads/${SYNC_BRANCH}`, '-f', `sha=${mainSha}`]);
+          }
+
+          // Re-fetches each file's sha on the branch itself right before
+          // writing it (not the sha read at step 3, which may be stale by
+          // now if this is the first write onto a freshly-created branch) --
+          // mirrors bootstrap-product-repo.sh's same guard for the same
+          // reason. Skips the PUT entirely if the freshly-derived content is
+          // byte-identical to what's already on the branch (e.g. status.json
+          // changed in a way that didn't move the feed's rendered content).
+          function putIfChanged(path, content, message) {
+            let branchFile = null;
+            try {
+              branchFile = JSON.parse(gh(['api', `repos/${STATUS_REPO}/contents/${path}?ref=${SYNC_BRANCH}`]));
+            } catch (e) {
+              // Doesn't exist on the branch yet (first write, or branch just created off main).
+            }
+            if (branchFile && Buffer.from(branchFile.content, 'base64').toString('utf8') === content) {
+              console.log(`${path}: unchanged on ${SYNC_BRANCH} — skipping.`);
+              return;
+            }
+            const putArgs = [
+              'api', '-X', 'PUT', `repos/${STATUS_REPO}/contents/${path}`,
+              '-f', `message=${message}`,
+              '-f', `content=${Buffer.from(content).toString('base64')}`,
+              '-f', `branch=${SYNC_BRANCH}`,
+            ];
+            if (branchFile) putArgs.push('-f', `sha=${branchFile.sha}`);
+            gh(putArgs);
+            console.log(`${path}: pushed to ${SYNC_BRANCH}.`);
+          }
+
+          putIfChanged(STATUS_FILE, newContent, `chore: sync status.json (${triggerIssue.url}) — platform#1943`);
+          putIfChanged(STATUS_FEED_FILE, newFeedContent, `chore: sync status-feed.xml (${triggerIssue.url}) — platform#1943/#2349`);
+
+          if (existingPr) {
+            console.log(`status-sync PR #${existingPr.number} already open — request-review.yml will re-dispatch a reviewer.`);
+          } else {
+            gh([
+              'pr', 'create', '--repo', STATUS_REPO,
+              '--base', 'main', '--head', SYNC_BRANCH,
+              '--title', 'chore: sync status.json',
+              '--body', `Automated status.json sync (status.yml, Refs #1943), triggered by ${triggerIssue.url}. Goes through the normal review-verdict gate like any other PR.`,
+            ]);
+            console.log('Opened status-sync PR — request-review.yml will dispatch a reviewer.');
+          }
+          NODE_EOF
+          node "$RUNNER_TEMP/status-update.js"
+
+      - name: Release status lock
+        if: always() && steps.lock.outputs.acquired == 'true'
+        run: |
+          aws dynamodb delete-item \
+            --table-name quineworks-state \
+            --key '{"pk": {"S": "status-lock"}}'
