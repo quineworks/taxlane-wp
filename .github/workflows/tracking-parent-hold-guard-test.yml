@@ -1,0 +1,30 @@
+# platform#3253: CI coverage for `decideBypass()`'s fixture test
+# (`scripts/test-tracking-parent-hold-guard.cjs`), same shape as
+# `tracking-parent-auto-closer-test.yml` — path-filtered so it only fires on
+# PRs actually touching the script, its test, or the live workflow that
+# wires it up.
+name: tracking-parent-hold-guard-test
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - "scripts/tracking-parent-hold-guard.cjs"
+      - "scripts/test-tracking-parent-hold-guard.cjs"
+      - ".github/workflows/tracking-parent-hold-guard.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracking-parent-hold-guard-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run decideBypass() fixture tests
+        run: node scripts/test-tracking-parent-hold-guard.cjs
