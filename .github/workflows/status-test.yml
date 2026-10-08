@@ -1,0 +1,40 @@
+# platform#1943: CI coverage for status-derive.cjs's deriveStatus(), the
+# label-event -> status.json transformation status.yml's live entrypoint
+# calls. Same shape as tracking-parent-auto-closer-test.yml (#564) for
+# decideClose() -- a new small workflow rather than a step bolted onto an
+# unrelated one, path-filtered so it only fires on PRs actually touching
+# the derivation logic, its test, or the live workflow that wires it up.
+# platform#2349: extended to also cover status-feed-derive.cjs's
+# deriveStatusFeedXml(), the paired status.json -> status-feed.xml
+# derivation status.yml's live entrypoint now also calls -- same file, not
+# a new workflow, since both fire off the same status.yml edits.
+name: status-test
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - "scripts/status-derive.cjs"
+      - "scripts/test-status.cjs"
+      - "scripts/status-feed-derive.cjs"
+      - "scripts/test-status-feed-derive.cjs"
+      - ".github/workflows/status.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: status-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run deriveStatus() fixture tests
+        run: node scripts/test-status.cjs
+
+      - name: Run deriveStatusFeedXml() fixture tests
+        run: node scripts/test-status-feed-derive.cjs
