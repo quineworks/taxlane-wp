@@ -1,0 +1,26 @@
+# Guardrail against the 2026-07-25 company-wide outage (platform#1555): a VPC
+# interface endpoint with private_dns_enabled=true hijacks the service DNS name
+# for the whole shared VPC, so its security group MUST admit the VPC on 443.
+# The pouchbooks Secrets Manager endpoint scoped its SG to one Lambda, cutting
+# Secrets Manager off for every agent task -> total outage. This check fails any
+# PR that reintroduces that anti-pattern. See scripts/check-vpce-private-dns-sg.py.
+name: vpce-sg-check
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vpce-sg-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - name: VPC private-DNS endpoint SG scope check
+        run: python3 scripts/check-vpce-private-dns-sg.py
