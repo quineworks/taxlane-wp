@@ -1,0 +1,33 @@
+# platform#564 (part 2/3 of #561): CI coverage for #563's `decideClose()`
+# fixture test (`scripts/test-tracking-parent-auto-closer.cjs`). No existing
+# workflow runs a Node test file, so this is a new small one rather than a
+# step bolted onto an unrelated workflow — path-filtered so it only fires on
+# PRs actually touching the script, its test, or the live workflow that
+# wires it up. `node:test` runs its `test()` calls when the file executes
+# directly, so this is exactly the `node scripts/...` invocation a
+# developer would run by hand, not a separate `--test` flag.
+name: tracking-parent-auto-closer-test
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - "scripts/tracking-parent-auto-closer.cjs"
+      - "scripts/test-tracking-parent-auto-closer.cjs"
+      - ".github/workflows/tracking-parent-auto-closer.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tracking-parent-auto-closer-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run decideClose() fixture tests
+        run: node scripts/test-tracking-parent-auto-closer.cjs
