@@ -1,0 +1,292 @@
+# platform#2336 (sub-issue platform#2338): sibling to qa-fixtures-check.yml's
+# *pre-merge* pairing check, this workflow is the *post-merge* run -- it
+# actually drives `agent/bin/render-interact` against a repo's own
+# `qa/fixtures.json` on every push to main, so real fixture failures no
+# longer depend on the every-4h `qa_dispatch` agent poll
+# (infra/qa_dispatch.tf) noticing them. Waking `qa` on a real failure
+# (platform#2339) and retiring that poll (platform#2340) are separate,
+# sequenced-after sub-issues -- this workflow only runs the check and
+# surfaces PASS/FAIL as its own job status.
+#
+# Self-excluded on quineworks/platform (`if:` below, same as
+# qa-fixtures-check.yml -- platform has no qa/fixtures.json of its own),
+# propagated to every product repo by sync-governance-workflows.yml +
+# bootstrap-product-repo.sh (NOT added to that script's DENYLIST, unlike a
+# platform-only workflow -- this one needs to run in every product repo).
+#
+# `render-interact` and its `agent/bin/lib/browser-launch.js` are used
+# as-is, unmodified -- but this workflow's job runs in a *product repo's*
+# own checkout (tax-lane, pouchbooks), which has no `agent/` tree of its
+# own. So it fetches platform's `agent/` directory (sparse checkout, via
+# the same cross-repo GitHub PAT sync-governance-workflows.yml already uses
+# from the secrets broker) and installs its runtime deps the same way
+# `agent/Dockerfile` does, rather than duplicating or reimplementing any of
+# render-interact's own logic here.
+#
+# Runs on the arm64 on-demand runner variant (`ondemand-arm64`,
+# infra/ci_runner_ondemand.tf): browser-launch.js's chromium pack URL is
+# hard-pinned to an arm64 build (its own header comment explains why -- an
+# x86 pack silently fails to launch), so this job needs to run on that
+# architecture natively, same reasoning build-agent.yml's own arm64 runner
+# choice already established.
+#
+# 2026-08-23 (tax-lane commit 5bb2491, run 32640582353): this job used to start on the bare `push`
+# event, running in parallel with -- not after -- that same commit's own
+# web-deploy.yml. render-interact hit production before the new bundle had
+# actually rolled out, timed out on `.locale-trigger` (a selector that only
+# existed post-deploy), and woke `qa` on a false regression -- same single-
+# deploy-workflow propagation race already documented for PouchBooks'
+# `e2e-account-lifecycle` (`feedback_e2e_account_lifecycle_single_deploy_
+# propagation_race` in company memory). The fix was the "wait for this
+# commit's own web-deploy run" step below, not a trigger change.
+#
+# 2026-08-23 (platform#2387, CEO directive): switched from per-merge
+# (`push`) to a once-daily `schedule` cron -- the wait-for-deploy step
+# above stays unchanged and still no-ops safely on a scheduled trigger:
+# `github.sha` resolves to main's current HEAD, and by the time the daily
+# cron fires hours after the last push, that commit's web-deploy run (if
+# any) is essentially always already `completed`, so both the "completed"
+# and "no matching run" branches fall through to "proceed immediately"
+# without ever actually waiting.
+#
+# 2026-09-15 (tax-lane@b1f97aa wake dispatch): this job ran
+# `render-interact` directly against the raw, unresolved `qa/fixtures.json`
+# it fetched via the Contents API -- it never ran a target repo's own
+# `scripts/resolve-qa-fixtures.cjs` (tax-lane#1148), so every
+# `expectedFormula`/`expectedRange` assertion silently fell back to its
+# checked-in literal `expectedNumeric`, which drifts stale every month
+# boundary exactly the way it did before #1148 (tax-lane's own
+# `qa/README.md` already documented this exact gap: "prefer `npm run
+# qa:fixtures` ... a direct run still works, but ... falls back to its
+# checked-in literal ... which drifts stale"). Fixed by having the discover
+# step also fetch `scripts/resolve-qa-fixtures.cjs` (404-tolerant, same
+# pattern as the fixtures.json fetch) and, if a target repo defines one,
+# running it against the fetched fixtures before render-interact -- kept
+# generic (no tax-lane-specific path) so any future product's own resolver
+# script gets picked up the same way, and a repo with no such script (or no
+# `expectedFormula`/`expectedRange` at all) is completely unaffected.
+#
+# 2026-09-28 (tax-lane#2397 review): tax-lane's resolver grew a third
+# extension (`selectorTemplate`, tax-lane#2395) that reads a *third* source
+# file (`web/src/lib/content/coverageChips.tsx`) this job never fetches --
+# same ENOENT-via-`__dirname` gap #1148 was fixed for above, just for a file
+# the resolver reads directly off disk instead of one this workflow passes
+# it. Rather than hardcoding that (or any future) source path here -- which
+# would break the "generic, no tax-lane-specific path" property above --
+# the resolve step now just exports `REPO` (`GH_TOKEN` was already in the
+# job env from the "Fetch cross-repo GitHub token" step), so a resolver
+# that needs to read a source file with no full checkout available can
+# fetch it itself via the Contents API, the same way this workflow's own
+# discover step does. A resolver with no such need is unaffected.
+name: qa-fixtures-run
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+concurrency:
+  group: qa-fixtures-run-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  run:
+    name: qa-fixtures-run
+    if: github.repository != 'quineworks/platform'
+    runs-on: ondemand-arm64
+    steps:
+      - name: Discover and fetch this repo's qa/fixtures.json
+        id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat > /tmp/discover-fixtures.js <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+          const fs = require('fs');
+
+          const REPO = process.env.REPO;
+
+          let out;
+          try {
+            out = execFileSync('gh', [
+              'api',
+              `repos/${REPO}/contents/qa/fixtures.json`,
+            ], { encoding: 'utf8' });
+          } catch (e) {
+            const stderr = String((e && e.stderr) || (e && e.message) || '');
+            if (/HTTP 404/i.test(stderr) || /Not Found/i.test(stderr)) {
+              console.log('No qa/fixtures.json in this repo -- skipping cleanly.');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'found=false\n');
+              process.exit(0);
+            }
+            console.error(stderr);
+            process.exit(1);
+          }
+
+          const data = JSON.parse(out);
+          const decoded = Buffer.from(data.content, 'base64').toString('utf8');
+          fs.writeFileSync('/tmp/fixtures.json', decoded);
+          console.log('Fetched qa/fixtures.json.');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'found=true\n');
+
+          // tax-lane#1148-style resolver script, entirely optional -- most
+          // repos won't have one. 404 is the expected/common case, not an
+          // error.
+          let resolverOut;
+          try {
+            resolverOut = execFileSync('gh', [
+              'api',
+              `repos/${REPO}/contents/scripts/resolve-qa-fixtures.cjs`,
+            ], { encoding: 'utf8' });
+          } catch (e) {
+            const stderr = String((e && e.stderr) || (e && e.message) || '');
+            if (/HTTP 404/i.test(stderr) || /Not Found/i.test(stderr)) {
+              console.log('No scripts/resolve-qa-fixtures.cjs in this repo -- running fixtures.json as-is.');
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, 'resolver=false\n');
+              process.exit(0);
+            }
+            console.error(stderr);
+            process.exit(1);
+          }
+          const resolverData = JSON.parse(resolverOut);
+          const resolverDecoded = Buffer.from(resolverData.content, 'base64').toString('utf8');
+          fs.writeFileSync('/tmp/resolve-qa-fixtures.cjs', resolverDecoded);
+          console.log('Fetched scripts/resolve-qa-fixtures.cjs.');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'resolver=true\n');
+          NODE_EOF
+          node /tmp/discover-fixtures.js
+
+      - name: Wait for this commit's own web-deploy run to finish, if any
+        id: wait_deploy
+        if: steps.discover.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          cat > /tmp/wait-web-deploy.js <<'NODE_EOF'
+          'use strict';
+          const { execFileSync } = require('child_process');
+
+          const REPO = process.env.REPO;
+          const SHA = process.env.SHA;
+          const DEADLINE = Date.now() + 10 * 60 * 1000;
+          const POLL_MS = 10 * 1000;
+
+          function api(path) {
+            const out = execFileSync('gh', ['api', path], { encoding: 'utf8' });
+            return JSON.parse(out);
+          }
+
+          for (;;) {
+            let data;
+            try {
+              data = api(
+                `repos/${REPO}/actions/workflows/web-deploy.yml/runs?head_sha=${SHA}`,
+              );
+            } catch (e) {
+              const stderr = String((e && e.stderr) || (e && e.message) || '');
+              if (/HTTP 404/i.test(stderr) || /Not Found/i.test(stderr)) {
+                console.log(
+                  "This repo has no web-deploy.yml workflow -- nothing to " +
+                    'wait for, proceeding immediately.',
+                );
+                process.exit(0);
+              }
+              throw e;
+            }
+            const run = data.workflow_runs && data.workflow_runs[0];
+
+            if (!run) {
+              console.log(
+                "No web-deploy run for this commit (its paths: filter didn't " +
+                  'match) -- nothing to wait for, proceeding immediately.',
+              );
+              process.exit(0);
+            }
+            if (run.status === 'completed') {
+              console.log(`web-deploy run ${run.id} completed: ${run.conclusion}`);
+              process.exit(0);
+            }
+            if (Date.now() > DEADLINE) {
+              console.log(
+                `Timed out waiting for web-deploy run ${run.id} (still ` +
+                  `${run.status}) -- proceeding anyway rather than hanging.`,
+              );
+              process.exit(0);
+            }
+            console.log(`web-deploy run ${run.id} still ${run.status} -- waiting...`);
+            execFileSync('sleep', [String(POLL_MS / 1000)]);
+          }
+          NODE_EOF
+          node /tmp/wait-web-deploy.js
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.discover.outputs.found == 'true'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Fetch cross-repo GitHub token
+        if: steps.discover.outputs.found == 'true'
+        # Same broker/field shape as sync-governance-workflows.yml's own
+        # "Fetch cross-repo GitHub token" step, but via the broadly-trusted
+        # `quineworks-github-actions` role instead of
+        # `quineworks-github-actions-platform`: this workflow triggers off
+        # a product repo's own push, never platform's, and
+        # `quineworks-github-actions-platform`'s trust is scoped to
+        # `repo:quineworks/platform:*` only, so it can't be assumed here.
+        # Both roles are already allowlisted for the `github_token` field
+        # (infra/secrets_broker.tf) -- no new grant needed.
+        run: |
+          BROKER_RESPONSE=$(curl -fsS \
+            --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+            --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" \
+            -H "x-amz-security-token: ${AWS_SESSION_TOKEN}" \
+            "https://r4c8q4snw0.execute-api.us-east-1.amazonaws.com/secret?field=github_token")
+          GITHUB_PAT=$(jq -r '.value' <<<"$BROKER_RESPONSE")
+          echo "::add-mask::${GITHUB_PAT}"
+          echo "GH_TOKEN=${GITHUB_PAT}" >> "$GITHUB_ENV"
+
+      - name: Check out platform's agent/ tree (render-interact + its deps)
+        if: steps.discover.outputs.found == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: quineworks/platform
+          token: ${{ env.GH_TOKEN }}
+          sparse-checkout: |
+            agent
+          path: platform-agent
+
+      - name: Install render-interact's runtime deps (Playwright + chromium-min)
+        if: steps.discover.outputs.found == 'true'
+        working-directory: platform-agent/agent
+        env:
+          # Matches agent/Dockerfile's own install: browser-launch.js
+          # launches @sparticuz/chromium-min, not Playwright's bundled
+          # browser, so there's no reason to spend time downloading one here.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: npm ci --omit=dev
+
+      - name: Resolve qa/fixtures.json's expectedFormula/expectedRange, if this repo defines a resolver
+        if: steps.discover.outputs.found == 'true' && steps.discover.outputs.resolver == 'true'
+        env:
+          # Lets a repo's resolver fetch other source files it needs via the
+          # Contents API (same pattern this step's own discover step already
+          # uses) instead of assuming a full checkout -- this job only ever
+          # checks out platform's agent/ tree, never the target repo's own
+          # source (tax-lane#2397). GH_TOKEN is already in the job env from
+          # the earlier "Fetch cross-repo GitHub token" step; a resolver with
+          # no such need (or no REPO/GH_TOKEN use at all) is unaffected.
+          REPO: ${{ github.repository }}
+        run: node /tmp/resolve-qa-fixtures.cjs /tmp/fixtures.json /tmp/fixtures.json
+
+      - name: Run render-interact against qa/fixtures.json
+        if: steps.discover.outputs.found == 'true'
+        run: node platform-agent/agent/bin/render-interact /tmp/fixtures.json
