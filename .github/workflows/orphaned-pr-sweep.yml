@@ -1,0 +1,151 @@
+# tax-lane#2809 (follow-up from tax-lane#2806's root-cause diagnosis on
+# tax-lane#2802): request-review.yml already self-heals a *lost* reviewer
+# dispatch (#673) via the `needs-review` label -- it's set unconditionally
+# on `opened`/`reopened`/`ready_for_review`, and a later `synchronize`/
+# `edited` push re-enqueues a reviewer as long as that label (or
+# `changes-requested`) is present. But that only covers the case where the
+# enqueue step failed *after* the label was applied. #2802 showed the gap
+# one level up: the `opened` event itself never fired at all (confirmed via
+# `gh api repos/.../commits/<sha>/check-suites` -- zero check-suites from
+# the `github-actions` app, while sibling PRs opened ~40s before/after it
+# got the full normal set). When that happens, `needs-review` never gets
+# set either, so no later push on that PR can ever re-trigger review -- the
+# gate requires a label nothing ever applied. The PR then silently sits
+# with zero labels, zero CI, zero review until a human/agent happens to
+# notice (tax-lane#2802 was only caught incidentally during an unrelated
+# duplicate-PR cleanup, tax-lane#2805).
+#
+# This workflow is the structural backstop event-driven request-review.yml
+# can't reach on its own: a periodic sweep (same idea as label-enforcer.yml
+# for issues, #85) over every open, non-draft PR in the repo. A PR is
+# "orphaned" if it's older than AGE_THRESHOLD_SECONDS below *and* has
+# neither `needs-review` nor `changes-requested` *and* has no completed
+# check-suite from the `github-actions` app on its head commit. The age
+# threshold exists so a PR opened seconds ago -- whose `opened` event is
+# simply still in flight -- doesn't get double-enqueued by this sweep
+# racing the normal path; the check-suite condition (not just "zero check
+# suites") so a PR whose CI is still legitimately running isn't flagged
+# just because the reviewer hasn't posted a verdict yet.
+#
+# An orphaned PR gets exactly what request-review.yml would have given it
+# on a normal `opened` event: the `needs-review` label (so any future push
+# re-enqueues normally even if this sweep doesn't catch the follow-up) and
+# a reviewer job enqueued directly, same SQS message shape as
+# request-review.yml's own "Enqueue reviewer job" step.
+#
+# Propagated to every product repo by sync-governance-workflows.yml +
+# bootstrap-product-repo.sh (not added to that script's DENYLIST -- this
+# needs to run in every repo with open PRs, platform included, the same
+# shape as request-review.yml/label-enforcer.yml themselves).
+#
+# This is a narrow edge case (one occurrence across ~15+ PRs the day it was
+# caught, no actual damage since that PR was a duplicate) so the cadence
+# below trades promptness for cost: every 15 minutes, not continuous
+# polling, mirroring the cost-consciousness already applied to this fleet's
+# other scheduled sweeps.
+name: orphaned-pr-sweep
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: orphaned-pr-sweep-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    runs-on: ondemand-x86_64
+    steps:
+      - name: Ensure the needs-review label exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh label create needs-review --repo "$REPO" --color b60205 \
+            --description "PR has never received a reviewer verdict; synchronize/edited pushes should re-enqueue" \
+            --force
+
+      - name: Find orphaned open PRs and apply needs-review
+        id: sweep
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          AGE_THRESHOLD_SECONDS=$((10 * 60))
+          NOW=$(date -u +%s)
+          : > /tmp/orphaned-prs.jsonl
+
+          gh pr list --repo "$REPO" --state open --limit 200 \
+            --json number,title,createdAt,isDraft,labels,headRefOid \
+            --jq '.[]' | while IFS= read -r PR; do
+            NUMBER=$(jq -r '.number' <<<"$PR")
+            TITLE=$(jq -r '.title' <<<"$PR")
+            IS_DRAFT=$(jq -r '.isDraft' <<<"$PR")
+            CREATED_AT=$(jq -r '.createdAt' <<<"$PR")
+            SHA=$(jq -r '.headRefOid' <<<"$PR")
+            LABELS=$(jq -r '[.labels[].name] | join(",")' <<<"$PR")
+
+            if [[ "$IS_DRAFT" == "true" ]]; then
+              continue
+            fi
+
+            if [[ ",${LABELS}," == *",changes-requested,"* || ",${LABELS}," == *",needs-review,"* ]]; then
+              continue
+            fi
+
+            CREATED_EPOCH=$(date -u -d "$CREATED_AT" +%s)
+            AGE=$((NOW - CREATED_EPOCH))
+            if (( AGE < AGE_THRESHOLD_SECONDS )); then
+              continue
+            fi
+
+            HAS_COMPLETED=$(gh api "repos/${REPO}/commits/${SHA}/check-suites" --paginate \
+              --jq '[.check_suites[]? | select(.app.slug == "github-actions" and .status == "completed")] | length')
+            if [[ "${HAS_COMPLETED:-0}" -gt 0 ]]; then
+              continue
+            fi
+
+            echo "Orphaned PR detected: #${NUMBER} \"${TITLE}\" (age ${AGE}s, labels: '${LABELS}')" >&2
+            gh pr edit "$NUMBER" --repo "$REPO" --add-label needs-review
+            gh pr comment "$NUMBER" --repo "$REPO" --body \
+              "Found with no \`needs-review\`/\`changes-requested\` label and no completed CI check-suite ${AGE}s after opening -- the \`opened\` event likely never fired for this PR (tax-lane#2802/#2806). Labeling \`needs-review\` and enqueueing a reviewer directly (tax-lane#2809)."
+            jq -nc --argjson number "$NUMBER" --arg title "$TITLE" '{number: $number, title: $title}' >> /tmp/orphaned-prs.jsonl
+          done
+
+          if [[ -s /tmp/orphaned-prs.jsonl ]]; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.sweep.outputs.found == 'true'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Enqueue reviewer jobs for orphaned PRs
+        if: steps.sweep.outputs.found == 'true'
+        env:
+          REPO: ${{ github.repository }}
+        # Same SQS message shape as request-review.yml's own "Enqueue
+        # reviewer job" step, including the hand-kept chat_id note there.
+        run: |
+          while IFS= read -r ORPHAN; do
+            NUMBER=$(jq -r '.number' <<<"$ORPHAN")
+            TITLE=$(jq -r '.title' <<<"$ORPHAN")
+            BODY=$(jq -n \
+              --arg ctx "Review PR #${NUMBER} in ${REPO}: ${TITLE} (orphaned-pr-sweep recovery -- tax-lane#2809)" \
+              '{role: "reviewer", context: $ctx, chat_id: "1952896608,5209713934", depth: 1}')
+            aws sqs send-message \
+              --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+              --message-body "$BODY"
+          done < /tmp/orphaned-prs.jsonl
