@@ -88,11 +88,17 @@
 # ENOBUFS` -- a CI capacity failure before render-interact ever ran, not a
 # real product regression. Fixed by giving both discover-step `gh api`
 # calls a generous explicit `maxBuffer` (10MB) instead of the 1MB default.
+#
+# 2026-10-10 (platform#3373 verification): added `workflow_dispatch` so a
+# fix to this workflow (like the `maxBuffer` one above) can be confirmed
+# against a specific product repo on demand, instead of waiting for the
+# next 03:00 UTC cron tick.
 name: qa-fixtures-run
 
 on:
   schedule:
     - cron: "0 3 * * *"
+  workflow_dispatch: {}
 
 permissions:
   id-token: write
