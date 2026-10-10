@@ -78,6 +78,16 @@
 # that needs to read a source file with no full checkout available can
 # fetch it itself via the Contents API, the same way this workflow's own
 # discover step does. A resolver with no such need is unaffected.
+#
+# 2026-10-10 (tax-lane run 38040687852, wake dispatch): the discover step's
+# `execFileSync('gh', ['api', ...])` calls had no `maxBuffer` option, so they
+# inherited Node's default 1MB limit. tax-lane's `qa/fixtures.json` (26
+# calculators x full locale coverage) grew its raw Contents API response
+# (base64 content plus the JSON envelope's other fields) past that 1MB
+# ceiling, which killed the child process and surfaced as `spawnSync gh
+# ENOBUFS` -- a CI capacity failure before render-interact ever ran, not a
+# real product regression. Fixed by giving both discover-step `gh api`
+# calls a generous explicit `maxBuffer` (10MB) instead of the 1MB default.
 name: qa-fixtures-run
 
 on:
@@ -117,7 +127,7 @@ jobs:
             out = execFileSync('gh', [
               'api',
               `repos/${REPO}/contents/qa/fixtures.json`,
-            ], { encoding: 'utf8' });
+            ], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
           } catch (e) {
             const stderr = String((e && e.stderr) || (e && e.message) || '');
             if (/HTTP 404/i.test(stderr) || /Not Found/i.test(stderr)) {
@@ -143,7 +153,7 @@ jobs:
             resolverOut = execFileSync('gh', [
               'api',
               `repos/${REPO}/contents/scripts/resolve-qa-fixtures.cjs`,
-            ], { encoding: 'utf8' });
+            ], { encoding: 'utf8', maxBuffer: 10 * 1024 * 1024 });
           } catch (e) {
             const stderr = String((e && e.stderr) || (e && e.message) || '');
             if (/HTTP 404/i.test(stderr) || /Not Found/i.test(stderr)) {
