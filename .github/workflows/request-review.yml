@@ -36,6 +36,39 @@
 # follow-up push can't cancel an in-flight opened/reopened/ready_for_review
 # run before its enqueue step sends the SQS message (that run is what gets
 # the PR its first review at all).
+#
+# That `concurrency` grouping only collapses runs that *overlap in time* —
+# it does nothing when each event's run finishes (and sends its SQS
+# message) before the next event even fires, which is the common case for a
+# few quick follow-up pushes (#3393, platform#3392/PR#3389): an `opened` run
+# enqueues reviewer job #1, then two `synchronize` runs each complete fast
+# enough to independently see `needs-review` still set (the first reviewer
+# hasn't posted a verdict yet) and each enqueue their own job, so three
+# independent reviewer passes race to review the same final commit. The
+# `review-outstanding` label is the cross-run signal that closes that gap:
+# set the moment any event here successfully enqueues, cleared only when
+# the reviewer posts a verdict of any kind (agent/roles/reviewer.md, same
+# place `needs-review`/`changes-requested` already get cleared). Every
+# enqueue attempt below — not just the sync/edited one — is gated on this
+# label being absent, so at most one reviewer job is ever outstanding for a
+# given PR. A push/edit that arrives while a job is outstanding is not
+# lost: `needs-review`/`changes-requested` stay set through the blocked
+# window (nothing here clears them), so once the outstanding job's verdict
+# clears `review-outstanding`, the next push/edit re-enqueues normally; a
+# reviewer job also always reviews the PR's live current state when it
+# actually runs (the SQS message names the PR, not a pinned SHA), not
+# necessarily the state at the moment it was enqueued. The one case this
+# doesn't close — a push landing in the narrow window after the
+# outstanding reviewer already started its review but before it posts a
+# verdict — is covered by platform#3394's reconciliation backstop in
+# `agent/roles/reviewer.md`, not here. If the outstanding job itself is
+# ever lost (dropped SQS delivery, crashed run — the same class of failure
+# `needs-review` already exists to survive), `orphaned-pr-sweep.yml` sweeps
+# up a `review-outstanding` label that's sat for too long with no verdict,
+# the same way it already sweeps up PRs whose `opened` event never fired at
+# all (#2809) — otherwise a single lost job would permanently block all
+# future re-review of that PR, a worse regression than the duplicate-
+# dispatch bug this is fixing.
 name: request-review
 
 on:
@@ -64,27 +97,29 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
-          if [[ "$EVENT_ACTION" != "synchronize" && "$EVENT_ACTION" != "edited" ]]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # synchronize and edited share this label-gated path (as opposed to
-          # opened/reopened/ready_for_review above, which always enqueue —
-          # there's no prior review to react to yet). The reviewer adds
-          # `changes-requested` when its verdict is Request changes, and
-          # clears both `changes-requested` and `needs-review` on any verdict
-          # (Merge/Request changes/Escalate) — see agent/roles/reviewer.md.
-          # `needs-review` is set unconditionally below on every
-          # opened/reopened/ready_for_review event, so its continued presence
-          # here means the reviewer never posted a first verdict — either
-          # because that earlier enqueue was lost, or a review is still in
-          # flight. Gating on either label's presence is the only signal a
-          # (re-)review is wanted.
           LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")')
           echo "Current labels: ${LABELS}" >&2
 
-          if [[ ",${LABELS}," == *",changes-requested,"* || ",${LABELS}," == *",needs-review,"* ]]; then
+          # opened/reopened/ready_for_review always want a review — there's
+          # no prior verdict to react to yet. synchronize/edited only want
+          # one if the reviewer hasn't posted a first verdict yet
+          # (`needs-review`, set unconditionally below on every
+          # opened/reopened/ready_for_review event and cleared only on a
+          # verdict of any kind — agent/roles/reviewer.md) or explicitly
+          # asked for a re-check after a fix (`changes-requested`).
+          if [[ "$EVENT_ACTION" != "synchronize" && "$EVENT_ACTION" != "edited" ]]; then
+            WANTS_REVIEW=true
+          elif [[ ",${LABELS}," == *",changes-requested,"* || ",${LABELS}," == *",needs-review,"* ]]; then
+            WANTS_REVIEW=true
+          else
+            WANTS_REVIEW=false
+          fi
+
+          # Regardless of event type, never enqueue a second job while one
+          # is already outstanding for this PR (#3393) — this is what
+          # collapses an opened + several quick synchronize events into a
+          # single reviewer pass instead of one per event.
+          if [[ "$WANTS_REVIEW" == "true" && ",${LABELS}," != *",review-outstanding,"* ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -136,3 +171,18 @@ jobs:
           aws sqs send-message \
             --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
             --message-body "$BODY"
+
+      - name: Mark PR as having an outstanding reviewer job
+        # Placed after the enqueue step with its default (non-`always()`)
+        # condition, so this only runs once the SQS send above actually
+        # succeeded — never mark a job outstanding that was never sent.
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh label create review-outstanding --repo "$REPO" --color 5319e7 \
+            --description "Reviewer job outstanding for this PR; blocks request-review.yml from enqueueing another one" \
+            --force
+          gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label review-outstanding

@@ -33,6 +33,27 @@
 # a reviewer job enqueued directly, same SQS message shape as
 # request-review.yml's own "Enqueue reviewer job" step.
 #
+# platform#3393 added a second, similarly-shaped recovery class to this same
+# sweep: `request-review.yml` now gates every reviewer enqueue on a
+# `review-outstanding` label (set the moment it dispatches a reviewer job,
+# cleared only when the reviewer posts a verdict), so at most one reviewer
+# job is ever outstanding per PR. That gate creates its own single point of
+# failure -- if the dispatched job itself is lost (dropped SQS delivery, a
+# crashed run that never reaches the verdict-posting step), `review-
+# outstanding` never clears, and nothing about the gate alone would ever
+# re-trigger a fresh dispatch: unlike the "opened event never fired" case
+# above, a push arriving in this state is *supposed* to no-op (the whole
+# point of the gate), so there's no later event to self-heal from. This
+# sweep is the backstop for that too: a PR whose `review-outstanding` label
+# has sat for longer than STUCK_REVIEW_THRESHOLD_SECONDS with no verdict
+# posted almost certainly lost its dispatched job, so the sweep clears the
+# label, re-adds `needs-review`, and enqueues a fresh reviewer job directly
+# -- same recovery action as the "never dispatched" case below, just a
+# different root cause. The threshold is read from the label's own
+# `labeled` timeline event (not the PR's `createdAt`/`updatedAt`, which
+# would be skewed by unrelated activity like comments) so a PR that's had
+# several review rounds doesn't get falsely flagged by its age.
+#
 # Propagated to every product repo by sync-governance-workflows.yml +
 # bootstrap-product-repo.sh (not added to that script's DENYLIST -- this
 # needs to run in every repo with open PRs, platform included, the same
@@ -72,6 +93,9 @@ jobs:
           gh label create needs-review --repo "$REPO" --color b60205 \
             --description "PR has never received a reviewer verdict; synchronize/edited pushes should re-enqueue" \
             --force
+          gh label create review-outstanding --repo "$REPO" --color 5319e7 \
+            --description "Reviewer job outstanding for this PR; blocks request-review.yml from enqueueing another one" \
+            --force
 
       - name: Find orphaned open PRs and apply needs-review
         id: sweep
@@ -80,6 +104,7 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           AGE_THRESHOLD_SECONDS=$((10 * 60))
+          STUCK_REVIEW_THRESHOLD_SECONDS=$((20 * 60))
           NOW=$(date -u +%s)
           : > /tmp/orphaned-prs.jsonl
 
@@ -94,6 +119,32 @@ jobs:
             LABELS=$(jq -r '[.labels[].name] | join(",")' <<<"$PR")
 
             if [[ "$IS_DRAFT" == "true" ]]; then
+              continue
+            fi
+
+            # A PR with review-outstanding set has a reviewer job dispatched
+            # for it already (request-review.yml, platform#3393) -- that's
+            # the normal "review legitimately in flight" state, not an
+            # orphan, unless the label has sat for too long with no verdict
+            # (the dispatched job was lost). Check this before the
+            # needs-review/changes-requested skip below, since
+            # review-outstanding is always set alongside one of those.
+            if [[ ",${LABELS}," == *",review-outstanding,"* ]]; then
+              LABELED_AT=$(gh api "repos/${REPO}/issues/${NUMBER}/timeline" --paginate \
+                --jq '[.[] | select(.event == "labeled" and .label.name == "review-outstanding")] | last | .created_at')
+              if [[ -n "$LABELED_AT" && "$LABELED_AT" != "null" ]]; then
+                LABELED_EPOCH=$(date -u -d "$LABELED_AT" +%s)
+                OUTSTANDING_AGE=$((NOW - LABELED_EPOCH))
+                if (( OUTSTANDING_AGE >= STUCK_REVIEW_THRESHOLD_SECONDS )); then
+                  echo "Stuck review-outstanding detected: #${NUMBER} \"${TITLE}\" (outstanding ${OUTSTANDING_AGE}s)" >&2
+                  gh pr edit "$NUMBER" --repo "$REPO" --remove-label review-outstanding
+                  gh pr edit "$NUMBER" --repo "$REPO" --add-label needs-review
+                  gh pr comment "$NUMBER" --repo "$REPO" --body \
+                    "\`review-outstanding\` has been set for ${OUTSTANDING_AGE}s with no verdict posted -- the dispatched reviewer job likely never completed (dropped delivery, crashed run). Clearing it and enqueueing a fresh reviewer job (platform#3393)."
+                  jq -nc --argjson number "$NUMBER" --arg title "$TITLE" \
+                    '{number: $number, title: $title, reason: "stuck-review-outstanding"}' >> /tmp/orphaned-prs.jsonl
+                fi
+              fi
               continue
             fi
 
@@ -117,7 +168,8 @@ jobs:
             gh pr edit "$NUMBER" --repo "$REPO" --add-label needs-review
             gh pr comment "$NUMBER" --repo "$REPO" --body \
               "Found with no \`needs-review\`/\`changes-requested\` label and no completed CI check-suite ${AGE}s after opening -- the \`opened\` event likely never fired for this PR (tax-lane#2802/#2806). Labeling \`needs-review\` and enqueueing a reviewer directly (tax-lane#2809)."
-            jq -nc --argjson number "$NUMBER" --arg title "$TITLE" '{number: $number, title: $title}' >> /tmp/orphaned-prs.jsonl
+            jq -nc --argjson number "$NUMBER" --arg title "$TITLE" \
+              '{number: $number, title: $title, reason: "never-dispatched"}' >> /tmp/orphaned-prs.jsonl
           done
 
           if [[ -s /tmp/orphaned-prs.jsonl ]]; then
@@ -135,17 +187,29 @@ jobs:
       - name: Enqueue reviewer jobs for orphaned PRs
         if: steps.sweep.outputs.found == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         # Same SQS message shape as request-review.yml's own "Enqueue
-        # reviewer job" step, including the hand-kept chat_id note there.
+        # reviewer job" step, including the hand-kept chat_id note there. Also
+        # sets review-outstanding right after sending, same as that step
+        # does -- otherwise a push landing moments after this direct enqueue
+        # would see no review-outstanding label and double-dispatch via
+        # request-review.yml, reintroducing the exact bug #3393 fixes there.
         run: |
           while IFS= read -r ORPHAN; do
             NUMBER=$(jq -r '.number' <<<"$ORPHAN")
             TITLE=$(jq -r '.title' <<<"$ORPHAN")
+            REASON=$(jq -r '.reason' <<<"$ORPHAN")
+            if [[ "$REASON" == "stuck-review-outstanding" ]]; then
+              RECOVERY_NOTE="orphaned-pr-sweep recovery -- platform#3393, stuck review-outstanding"
+            else
+              RECOVERY_NOTE="orphaned-pr-sweep recovery -- tax-lane#2809"
+            fi
             BODY=$(jq -n \
-              --arg ctx "Review PR #${NUMBER} in ${REPO}: ${TITLE} (orphaned-pr-sweep recovery -- tax-lane#2809)" \
+              --arg ctx "Review PR #${NUMBER} in ${REPO}: ${TITLE} (${RECOVERY_NOTE})" \
               '{role: "reviewer", context: $ctx, chat_id: "1952896608,5209713934", depth: 1}')
             aws sqs send-message \
               --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
               --message-body "$BODY"
+            gh pr edit "$NUMBER" --repo "$REPO" --add-label review-outstanding
           done < /tmp/orphaned-prs.jsonl
