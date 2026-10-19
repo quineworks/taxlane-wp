@@ -1,0 +1,105 @@
+<!-- @dsCard group="Social preview" name="taxlane-wp — C: stat row" subtitle="Dark card, mark + wordmark + bold stat row" -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 1280px;
+    height: 640px;
+    overflow: hidden;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .card {
+    width: 1280px;
+    height: 640px;
+    background: #0B2A1D;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 0 96px;
+  }
+  .top {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    margin-bottom: 44px;
+  }
+  h1 {
+    color: #FFFFFF;
+    font-size: 52px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+    line-height: 1.12;
+  }
+  p.tagline {
+    color: #9FC7B4;
+    font-size: 25px;
+    font-weight: 500;
+    margin-top: 10px;
+    max-width: 760px;
+  }
+  .stats {
+    display: flex;
+    gap: 0;
+    border-top: 1px solid #1E4432;
+    padding-top: 40px;
+  }
+  .stat {
+    flex: 1;
+    padding-right: 40px;
+  }
+  .stat + .stat {
+    border-left: 1px solid #1E4432;
+    padding-left: 40px;
+  }
+  .stat .num {
+    color: #BBDDD0;
+    font-size: 56px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+  }
+  .stat .lbl {
+    color: #9FC7B4;
+    font-size: 21px;
+    font-weight: 600;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="top">
+      <svg width="96" height="96" viewBox="0 0 32 32" fill="none">
+        <rect x="6" y="23" width="5" height="9" rx="1.5" fill="#FFFFFF"/>
+        <rect x="13.5" y="18" width="5" height="14" rx="1.5" fill="#FFFFFF"/>
+        <rect x="21" y="12" width="5" height="20" rx="1.5" fill="#34D399"/>
+      </svg>
+      <div>
+        <h1>TaxLane Nigeria Tax Calculators</h1>
+        <p class="tagline">The free WordPress plugin for Nigeria tax calculators — one shortcode, zero dependencies.</p>
+      </div>
+    </div>
+    <div class="stats">
+      <div class="stat">
+        <div class="num">27</div>
+        <div class="lbl">Calculators</div>
+      </div>
+      <div class="stat">
+        <div class="num">5</div>
+        <div class="lbl">Languages</div>
+      </div>
+      <div class="stat">
+        <div class="num">1</div>
+        <div class="lbl">Shortcode</div>
+      </div>
+      <div class="stat">
+        <div class="num">₦0</div>
+        <div class="lbl">Cost, ever</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
