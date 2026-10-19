@@ -1,0 +1,151 @@
+<!-- @dsCard group="Social preview" name="taxlane-wp — B: shortcode window" subtitle="Light card, faux block editor with shortcode + live result chip" -->
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 1280px;
+    height: 640px;
+    overflow: hidden;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .card {
+    width: 1280px;
+    height: 640px;
+    background: #F7FBF9;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    padding: 64px 80px;
+  }
+  .top {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    margin-bottom: 36px;
+  }
+  .mark { flex: none; }
+  h1 {
+    color: #0B2A1D;
+    font-size: 42px;
+    font-weight: 800;
+    letter-spacing: -0.01em;
+  }
+  p.tagline {
+    color: #3A5248;
+    font-size: 24px;
+    font-weight: 500;
+    margin-top: 6px;
+  }
+  .window {
+    flex: 1;
+    background: #0F1A15;
+    border-radius: 18px;
+    box-shadow: 0 24px 60px rgba(11,42,29,0.18);
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .titlebar {
+    height: 48px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 20px;
+    background: #16231C;
+    border-bottom: 1px solid #22332A;
+  }
+  .dot { width: 13px; height: 13px; border-radius: 50%; }
+  .d1 { background: #FF6159; }
+  .d2 { background: #FFBD2E; }
+  .d3 { background: #28C840; }
+  .filename {
+    margin-left: 14px;
+    color: #7FA592;
+    font-size: 17px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  }
+  .body {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    padding: 0 48px;
+    gap: 44px;
+  }
+  .code {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 27px;
+    line-height: 1.7;
+    color: #D6ECE1;
+  }
+  .code .kw { color: #BBDDD0; }
+  .code .str { color: #FFD98E; }
+  .code .cmt { color: #5C7D6E; }
+  .result {
+    flex: none;
+    width: 300px;
+    background: #16231C;
+    border: 1px solid #28392F;
+    border-radius: 14px;
+    padding: 24px 26px;
+  }
+  .result .label {
+    color: #7FA592;
+    font-size: 16px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 10px;
+  }
+  .result .amount {
+    color: #FFFFFF;
+    font-size: 34px;
+    font-weight: 800;
+  }
+  .result .sub {
+    color: #7FA592;
+    font-size: 16px;
+    margin-top: 8px;
+  }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="top">
+      <svg class="mark" width="64" height="64" viewBox="0 0 32 32" fill="none">
+        <rect x="6" y="23" width="5" height="9" rx="1.5" fill="#0B2A1D"/>
+        <rect x="13.5" y="18" width="5" height="14" rx="1.5" fill="#0B2A1D"/>
+        <rect x="21" y="12" width="5" height="20" rx="1.5" fill="#0B8457"/>
+      </svg>
+      <div>
+        <h1>TaxLane Nigeria Tax Calculators</h1>
+        <p class="tagline">One shortcode embeds a live Nigeria tax calculator on any WordPress page.</p>
+      </div>
+    </div>
+    <div class="window">
+      <div class="titlebar">
+        <div class="dot d1"></div><div class="dot d2"></div><div class="dot d3"></div>
+        <span class="filename">page.php — Block editor</span>
+      </div>
+      <div class="body">
+        <div class="code">
+          <div><span class="cmt">// Paste into any page or post</span></div>
+          <div>[<span class="kw">taxlane_calculator</span> <span class="kw">type</span>=<span class="str">"paye"</span>]</div>
+          <div>&nbsp;</div>
+          <div><span class="cmt">// Dark theme, Hausa locale</span></div>
+          <div>[<span class="kw">taxlane_calculator</span> <span class="kw">type</span>=<span class="str">"vat"</span></div>
+          <div>&nbsp;&nbsp;<span class="kw">theme</span>=<span class="str">"dark"</span> <span class="kw">locale</span>=<span class="str">"ha"</span>]</div>
+        </div>
+        <div class="result">
+          <div class="label">PAYE this month</div>
+          <div class="amount">₦42,180</div>
+          <div class="sub">Live, no page reload</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>
