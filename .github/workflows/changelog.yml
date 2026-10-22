@@ -68,6 +68,24 @@
 # carries the repo name (`(reponame#N)`), so numbers only collide when both
 # the repo and the PR number match, which can't happen.
 #
+# tax-lane#3099: three push-backstop runs in a 7-minute window (2026-10-22
+# 15:26-15:33 UTC, one per merge to tax-lane main that day plus one re-push
+# of an already-merged commit) all failed identically: `gh api
+# .../commits/{sha}/pulls` errored "unexpected end of JSON input" about one
+# second after the step started, itself seconds after the merge landed.
+# GitHub's commit<->PR association behind that endpoint lags the merge by a
+# few seconds; called too soon, it answers with an empty body (not a valid
+# `[]`) and `--jq` chokes on it. `ondemand-x86_64`'s per-run fresh runner
+# (vs. the old persistent fleet, platform#2262) starts jobs faster than
+# before, landing this call closer to the merge and surfacing the race for
+# the first time in ~75 prior push-triggered runs with zero failures. No
+# changelog data was lost either time -- `append` (triggered by this same
+# merge's `pull_request: closed` event) had already written both lines by
+# the time push-backstop ran -- but failing the job outright instead of
+# retrying turns a backstop step into a false-positive CI alert on an
+# ordinary merge. Retrying with backoff below gives the index a few more
+# seconds to catch up before this step gives up for real.
+#
 # platform#1836: every scratch file below used a hardcoded `/tmp/...` path.
 # The persistent fleet's runners (since migrated off, platform#2262) weren't
 # containerized per job -- `/tmp` was the shared host OS temp dir, not
@@ -228,13 +246,34 @@ jobs:
       # Re-derives the merged PR(s) behind this push directly from the
       # commit, since the `pull_request` event that normally carries this
       # information can silently never fire (platform#1239).
+      #
+      # tax-lane#3099: GitHub's commit<->PR association behind this endpoint
+      # lags the merge by a few seconds -- called too soon (as this step now
+      # reliably is, since `ondemand-x86_64`'s per-run fresh runner starts
+      # jobs faster than the old persistent fleet did), it answers with an
+      # empty body instead of a valid `[]`, and `--jq` fails with "unexpected
+      # end of JSON input". Retry with backoff rather than fail outright --
+      # this step is just a backstop (a no-op on the normal path, since
+      # `append` already handled it), so a false-positive failure here is
+      # pure noise, not a sign anything was lost.
       - name: Find merged PR(s) for the pushed commit
         id: find-prs
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
-            --jq '[.[] | select(.merged_at != null) | {number, title}]' > $RUNNER_TEMP/prs.json
+          for i in $(seq 1 5); do
+            if gh api "repos/${{ github.repository }}/commits/${{ github.sha }}/pulls" \
+              --jq '[.[] | select(.merged_at != null) | {number, title}]' \
+              > "$RUNNER_TEMP/prs.json" 2>"$RUNNER_TEMP/find-prs-err.log"; then
+              break
+            fi
+            cat "$RUNNER_TEMP/find-prs-err.log" >&2
+            if [[ "$i" -eq 5 ]]; then
+              echo "Still failing after 5 attempts, giving up." >&2
+              exit 1
+            fi
+            sleep $((i * 3))
+          done
           echo "count=$(jq 'length' $RUNNER_TEMP/prs.json)" >> "$GITHUB_OUTPUT"
           echo "repo=${{ github.event.repository.name }}" >> "$GITHUB_OUTPUT"
 
