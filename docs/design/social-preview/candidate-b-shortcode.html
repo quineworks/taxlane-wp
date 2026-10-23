@@ -4,12 +4,22 @@
 <head>
 <meta charset="utf-8">
 <style>
+  /* Headless-Chromium's system font stack lacks the Naira sign (U+20A6) —
+     without this, the "amount" chip's ₦42,180 silently drops the symbol
+     (no tofu box, just gone). Same gap as tax-app#138/tax-lane#1367, same
+     self-hosted fix reused from tax-lane's design-candidate precedent. */
+  @font-face {
+    font-family: 'TaxLane Glyph Fallback';
+    src: url('./taxlane-glyph-fallback.woff2') format('woff2');
+    unicode-range: U+0198, U+0199, U+0253, U+0257, U+20A6;
+    font-display: swap;
+  }
   * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
     width: 1280px;
     height: 640px;
     overflow: hidden;
-    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-family: 'TaxLane Glyph Fallback', -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   }
   .card {
     width: 1280px;
