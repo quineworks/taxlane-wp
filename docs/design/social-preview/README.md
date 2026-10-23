@@ -42,3 +42,15 @@ Copy stats (27 calculators, 5 languages — English + Pidgin + Hausa +
 Yorùbá + Igbo) reflect the current catalog per `memory/COMPANY.md`, not
 `wp-plugin/readme.txt`'s own description line (`tax-lane`'s readme.txt
 predates several later calculators and is out of this run's scope to fix).
+
+**Naira-glyph fix (2026-10-23):** candidates B and C's rendered PNGs
+originally dropped the ₦ sign entirely (not a tofu box — the glyph
+silently vanished) because headless Chromium's system font stack lacks
+Unicode U+20A6 coverage. Same bug class as `tax-app#138`/`tax-lane#1367`;
+fixed with the same self-hosted-subset-font pattern already used across
+`tax-lane`'s own `docs/design/*` candidates — `taxlane-glyph-fallback.woff2`
+(copied into this directory) loaded via `@font-face`/`unicode-range` and
+placed first in each affected candidate's font stack. Candidate A doesn't
+use the ₦ symbol, so it's unaffected. Both screenshots re-rendered at the
+exact 1280×640 target size and verified to show the glyph correctly before
+replacing the originals.
