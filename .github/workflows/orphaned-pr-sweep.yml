@@ -76,6 +76,9 @@ permissions:
   contents: read
   issues: write
   pull-requests: write
+  # check-suites below needs this explicitly -- issues/pull-requests write
+  # doesn't cover it (tax-lane#3193, HTTP 403).
+  checks: read
 
 concurrency:
   group: orphaned-pr-sweep-${{ github.repository }}
