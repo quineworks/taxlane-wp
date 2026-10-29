@@ -38,15 +38,15 @@ candidates follow the canonical BRAND.md mark instead, consistent with how
 it's used everywhere else (quineworks.com's `.product-mark-tile`, the live
 `tax.quineworks.com` app header).
 
-Copy stats (29 calculators, 5 languages — English + Pidgin + Hausa +
+Copy stats (31 calculators, 5 languages — English + Pidgin + Hausa +
 Yorùbá + Igbo) reflect the current catalog per `memory/COMPANY.md`
-(13 federal + 16 state Land Use Charge, as of 2026-10-27's Nasarawa
-addition), not `wp-plugin/readme.txt`'s own description line (`tax-lane`'s
+(13 federal + 18 state Land Use Charge, Ekiti the 18th state, as of
+2026-10-28), not `wp-plugin/readme.txt`'s own description line (`tax-lane`'s
 readme.txt predates several later calculators and is out of this run's
-scope to fix). Updated 2026-10-28 from the prior "27" figure — candidate B
-(the approved pick, pending CEO manual upload per the paired issue) carries
-no calculator count so it's unaffected by this catalog growth; only A and C
-needed the refresh.
+scope to fix). Updated again from the prior "29" figure (itself a
+2026-10-28 refresh from "27") — candidate B (the approved pick, pending
+CEO manual upload per the paired issue) carries no calculator count so
+it's unaffected by this catalog growth; only A and C needed the refresh.
 
 **Naira-glyph fix (2026-10-23):** candidates B and C's rendered PNGs
 originally dropped the ₦ sign entirely (not a tofu box — the glyph
