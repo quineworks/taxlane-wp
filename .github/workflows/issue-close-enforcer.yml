@@ -12,13 +12,17 @@
 # Two triggers in one file:
 #   - `pull_request` `closed`, gated on `.merged == true`: extract the same
 #     bare `#NNN` set used by `closing-keyword-check.yml` from the merged
-#     PR's title+body, resolve each via `gh api repos/$REPO/issues/$NNN`
-#     (skip PRs, skip unresolved numbers), and for any resolved issue still
-#     `open` — regardless of *why* GitHub's own keyword-close didn't fire —
-#     apply the `needs-close-check` marker label + one comment linking the
-#     merged PR, then enqueue a `cto` triage job. Gated on the marker not
-#     already being present per issue, so redelivered events or multiple
-#     merges referencing the same stale issue don't spam duplicate
+#     PR's title+body, drop any number covered by an explicit non-closing
+#     marker (`Related to`/`Refs`/`Part of`/`See`/`Contributes to`/
+#     `Tracked by #NNN` — `NON_CLOSING_MARKER`/`collectCovered()` ported
+#     verbatim from `closing-keyword-check.yml`, #3551), resolve each
+#     survivor via `gh api repos/$REPO/issues/$NNN` (skip PRs, skip
+#     unresolved numbers), and for any resolved issue still `open` —
+#     regardless of *why* GitHub's own keyword-close didn't fire — apply
+#     the `needs-close-check` marker label + one comment linking the merged
+#     PR, then enqueue a `cto` triage job. Gated on the marker not already
+#     being present per issue, so redelivered events or multiple merges
+#     referencing the same stale issue don't spam duplicate
 #     comments/enqueues.
 #   - `issues` `closed`: if the closed issue carries `needs-close-check`,
 #     remove it (self-heal, mirrors `label-enforcer.yml`'s own marker
@@ -127,10 +131,42 @@ jobs:
             return numbers;
           }
 
+          // --- verbatim copy of closing-keyword-check.yml's collectCovered()/
+          // NON_CLOSING_MARKER (#1069/#3551) — only the sameRepo half is used
+          // here since this workflow's extractCandidateNumbers() above never
+          // tracks cross-repo candidates in the first place.
+          function collectCovered(s, keywordPattern) {
+            const sameRepo = new Set();
+            const crossRepo = new Map();
+            const re = new RegExp(keywordPattern.source, keywordPattern.flags);
+            let m;
+            while ((m = re.exec(s)) !== null) {
+              const listRe = /(?:([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+))?#(\d+)/g;
+              let nm;
+              while ((nm = listRe.exec(m[2])) !== null) {
+                if (nm[1]) {
+                  const key = nm[1].toLowerCase();
+                  if (!crossRepo.has(key)) crossRepo.set(key, new Set());
+                  crossRepo.get(key).add(Number(nm[2]));
+                } else {
+                  sameRepo.add(Number(nm[2]));
+                }
+              }
+            }
+            return { sameRepo, crossRepo };
+          }
+
+          const REF_ITEM = '(?:[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)?#\\d+';
+          const REF_LIST = `(?:${REF_ITEM}(?:\\s*,\\s*|\\s+and\\s+|\\s*&\\s*)?)+`;
+          const NON_CLOSING_MARKER = new RegExp(`\\b(related to|refs?|part of|see|contributes? to|tracked by)\\b\\s*:?\\s*(${REF_LIST})`, 'gi');
+          // --- end verbatim copy ---
+
           const candidates = extractCandidateNumbers(stripCode(text), CURRENT_REPO);
+          const marker = collectCovered(stripCode(text), NON_CLOSING_MARKER);
           const leaked = [];
 
           for (const n of candidates) {
+            if (marker.sameRepo.has(n)) continue; // explicit non-closing marker — deliberate, not a leak.
             let data;
             try {
               const out = execFileSync('gh', ['api', `repos/${REPO}/issues/${n}`], { encoding: 'utf8' });
