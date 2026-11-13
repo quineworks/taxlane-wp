@@ -226,10 +226,13 @@ jobs:
           const { execFileSync } = require('child_process');
           const { deriveStatus, COMPONENTS } = require(process.env.GITHUB_WORKSPACE + '/scripts/status-derive.cjs');
           const { deriveStatusFeedXml } = require(process.env.GITHUB_WORKSPACE + '/scripts/status-feed-derive.cjs');
+          const { bumpLastmod } = require(process.env.GITHUB_WORKSPACE + '/scripts/sitemap-lastmod-check.cjs');
 
           const STATUS_REPO = 'quineworks/platform';
           const STATUS_FILE = 'site/public/status.json';
           const STATUS_FEED_FILE = 'site/public/status-feed.xml';
+          const SITEMAP_FILE = 'site/public/sitemap.xml';
+          const STATUS_FEED_LOC = 'https://quineworks.com/status-feed.xml';
           const SYNC_BRANCH = 'status-sync';
           const REPOS = ['quineworks/platform', 'quineworks/tax-lane'];
 
@@ -394,7 +397,7 @@ jobs:
             }
             if (branchFile && Buffer.from(branchFile.content, 'base64').toString('utf8') === content) {
               console.log(`${path}: unchanged on ${SYNC_BRANCH} — skipping.`);
-              return;
+              return false;
             }
             const putArgs = [
               'api', '-X', 'PUT', `repos/${STATUS_REPO}/contents/${path}`,
@@ -405,10 +408,32 @@ jobs:
             if (branchFile) putArgs.push('-f', `sha=${branchFile.sha}`);
             gh(putArgs);
             console.log(`${path}: pushed to ${SYNC_BRANCH}.`);
+            return true;
           }
 
           putIfChanged(STATUS_FILE, newContent, `chore: sync status.json (${triggerIssue.url}) — platform#1943`);
-          putIfChanged(STATUS_FEED_FILE, newFeedContent, `chore: sync status-feed.xml (${triggerIssue.url}) — platform#1943/#2349`);
+          const feedChanged = putIfChanged(STATUS_FEED_FILE, newFeedContent, `chore: sync status-feed.xml (${triggerIssue.url}) — platform#1943/#2349`);
+
+          // 6. sitemap.xml's lastmod for status-feed.xml is hand-maintained
+          // like every other sitemap-lastmod-check.yml-covered page
+          // (platform#1830) -- this is the one write path that otherwise
+          // always trips that guard on its own PR (platform#3641/#3642),
+          // since nothing in this workflow is a human who'd remember to bump
+          // it by hand. Only runs when status-feed.xml's content actually
+          // changed on the branch above; reads sitemap.xml fresh off
+          // SYNC_BRANCH for the same staleness reason putIfChanged does.
+          if (feedChanged) {
+            let sitemapContent = '';
+            try {
+              const sitemapJson = JSON.parse(gh(['api', `repos/${STATUS_REPO}/contents/${SITEMAP_FILE}?ref=${SYNC_BRANCH}`]));
+              sitemapContent = Buffer.from(sitemapJson.content, 'base64').toString('utf8');
+            } catch (e) {
+              // sitemap.xml always exists on main/the branch in practice; an
+              // unreadable fetch just means bumpLastmod below is a no-op.
+            }
+            const bumpedSitemap = bumpLastmod(sitemapContent, STATUS_FEED_LOC, now.slice(0, 10));
+            putIfChanged(SITEMAP_FILE, bumpedSitemap, `chore: bump sitemap lastmod for status-feed.xml (${triggerIssue.url}) — platform#1943/#1830`);
+          }
 
           if (existingPr) {
             console.log(`status-sync PR #${existingPr.number} already open — request-review.yml will re-dispatch a reviewer.`);
