@@ -423,16 +423,17 @@ jobs:
           // changed on the branch above; reads sitemap.xml fresh off
           // SYNC_BRANCH for the same staleness reason putIfChanged does.
           if (feedChanged) {
-            let sitemapContent = '';
             try {
               const sitemapJson = JSON.parse(gh(['api', `repos/${STATUS_REPO}/contents/${SITEMAP_FILE}?ref=${SYNC_BRANCH}`]));
-              sitemapContent = Buffer.from(sitemapJson.content, 'base64').toString('utf8');
+              const sitemapContent = Buffer.from(sitemapJson.content, 'base64').toString('utf8');
+              const bumpedSitemap = bumpLastmod(sitemapContent, STATUS_FEED_LOC, now.slice(0, 10));
+              putIfChanged(SITEMAP_FILE, bumpedSitemap, `chore: bump sitemap lastmod for status-feed.xml (${triggerIssue.url}) — platform#1943/#1830`);
             } catch (e) {
               // sitemap.xml always exists on main/the branch in practice; an
-              // unreadable fetch just means bumpLastmod below is a no-op.
+              // unreadable fetch just means we skip the lastmod bump this
+              // run rather than risk writing empty content (platform#3651).
+              console.log(`sitemap.xml fetch failed — skipping lastmod bump: ${e.message}`);
             }
-            const bumpedSitemap = bumpLastmod(sitemapContent, STATUS_FEED_LOC, now.slice(0, 10));
-            putIfChanged(SITEMAP_FILE, bumpedSitemap, `chore: bump sitemap lastmod for status-feed.xml (${triggerIssue.url}) — platform#1943/#1830`);
           }
 
           if (existingPr) {
