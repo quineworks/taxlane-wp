@@ -256,3 +256,65 @@ test('a second labeled event on the same already-closed issue (e.g. component ad
 // acquire/release primitive around the read-derive-write, not of this pure
 // function, so it isn't (and can't usefully be) fixture-tested here. See
 // status.yml's own comments for the lock.
+
+// platform#3685: reproduces the exact stuck-open sequence found live on
+// platform#3640 -- `live-incident` removed one second before the issue was
+// closed, two separate webhook events. The `closed` event's run sees labels
+// already missing `live-incident` and skips the recompute entirely (so it
+// never calls deriveStatus() at all -- nothing to fixture-test there). The
+// `unlabeled` event's run does call deriveStatus(), but a race against the
+// shared status-sync branch/lock meant its live `openIssues` query result
+// (correctly empty) ended up applied against a stale `existingIncidents`
+// read, so the entry's resolvedAt: null survived untouched. Mirrors that
+// surviving-stale-entry case directly: an existingIncidents entry stuck at
+// resolvedAt: null, absent from openIssues (as it would be either way,
+// since the underlying issue is closed), no triggerIssue (standing in for
+// "whichever event this was, it no longer matters"). unresolvedIssueStates
+// is deriveStatus()'s new, independent signal -- a direct live read of that
+// entry's own issue -- and should resolve it regardless.
+test('platform#3685: a closed incident stuck at resolvedAt: null (label/close race) self-heals once its own issue is checked directly', () => {
+  const existingIncidents = [{
+    url: 'https://github.com/quineworks/platform/issues/3640',
+    title: 'infra-apply stuck queued 6+h: quineworks.com homepage missing afternoon merges',
+    components: ['quineworks-site'],
+    state: 'degraded',
+    openedAt: '2026-11-13T19:09:48Z',
+    resolvedAt: null,
+  }];
+  const unresolvedIssueStates = {
+    'https://github.com/quineworks/platform/issues/3640': {
+      isOpen: false,
+      closedAt: '2026-11-13T19:24:35Z',
+    },
+  };
+  const result = deriveStatus({ existingIncidents, openIssues: [], unresolvedIssueStates, now: NOW });
+  assert.equal(componentState(result, 'quineworks-site'), 'operational');
+  assert.equal(result.incidents.length, 1);
+  assert.equal(result.incidents[0].resolvedAt, '2026-11-13T19:24:35Z');
+});
+
+test('platform#3685: the live openIssues query still wins if it disagrees with a stale unresolvedIssueStates read', () => {
+  const existingIncidents = [{
+    url: 'https://github.com/quineworks/platform/issues/3640',
+    title: 'Still ongoing',
+    components: ['quineworks-site'],
+    state: 'degraded',
+    openedAt: '2026-11-13T19:09:48Z',
+    resolvedAt: null,
+  }];
+  const openIssues = [{
+    url: 'https://github.com/quineworks/platform/issues/3640',
+    title: 'Still ongoing',
+    componentIds: ['quineworks-site'],
+    severityDown: false,
+    createdAt: '2026-11-13T19:09:48Z',
+  }];
+  // Deliberately contradictory/stale: the fresh cross-repo list says this
+  // issue is open, but the per-entry read somehow came back saying closed.
+  const unresolvedIssueStates = {
+    'https://github.com/quineworks/platform/issues/3640': { isOpen: false, closedAt: '2026-11-13T19:24:35Z' },
+  };
+  const result = deriveStatus({ existingIncidents, openIssues, unresolvedIssueStates, now: NOW });
+  assert.equal(componentState(result, 'quineworks-site'), 'degraded');
+  assert.equal(result.incidents[0].resolvedAt, null);
+});
