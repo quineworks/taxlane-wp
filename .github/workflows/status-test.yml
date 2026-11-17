@@ -18,7 +18,9 @@ on:
       - "scripts/test-status.cjs"
       - "scripts/status-feed-derive.cjs"
       - "scripts/test-status-feed-derive.cjs"
+      - "scripts/status-sync-run.cjs"
       - ".github/workflows/status.yml"
+      - ".github/workflows/status-resync.yml"
 
 permissions:
   contents: read
