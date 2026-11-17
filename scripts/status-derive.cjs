@@ -58,8 +58,31 @@ const COMPONENTS = [
 // available (e.g. the `live-incident` label was simply removed from a
 // still-open issue -- nothing "closed", so there's no closedAt to use).
 // Passed in explicitly (not Date.now()) so this stays a pure function.
-function deriveStatus({ existingIncidents = [], openIssues = [], triggerIssue = null, now }) {
+//
+// unresolvedIssueStates: platform#3685 (label/close race leaving an
+// incident permanently stuck open). Map/plain object, url -> { isOpen,
+// closedAt }, covering every existingIncidents entry with resolvedAt:
+// null -- the live state of *that entry's own issue*, read fresh
+// regardless of which event (if any) triggered this run. This is a second,
+// independent signal from `openIssues`/`triggerIssue`: those two are both
+// keyed off "what did this one event's webhook payload say" or "what does
+// a live cross-repo list query return right now", either of which can miss
+// a resolution if a close and a label-removal on the same issue race each
+// other across two separate webhook events/runs (platform#3685's root
+// cause). Checking each unresolved entry's own issue directly closes that
+// whole race class: an entry only stays unresolved here if its issue is
+// actually still open, not merely because it didn't show up in a list or
+// wasn't the one that fired this event.
+function deriveStatus({ existingIncidents = [], openIssues = [], triggerIssue = null, unresolvedIssueStates = {}, now }) {
   const byUrl = new Map((existingIncidents || []).map((i) => [i.url, i]));
+
+  for (const [url, prior] of byUrl) {
+    if (prior.resolvedAt !== null) continue;
+    const liveState = unresolvedIssueStates[url];
+    if (liveState && liveState.isOpen === false) {
+      byUrl.set(url, { ...prior, resolvedAt: liveState.closedAt || now });
+    }
+  }
 
   if (triggerIssue && triggerIssue.isLiveIncident && !triggerIssue.isOpen) {
     const prior = byUrl.get(triggerIssue.url);
