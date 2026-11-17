@@ -19,6 +19,7 @@ on:
       - "scripts/status-feed-derive.cjs"
       - "scripts/test-status-feed-derive.cjs"
       - "scripts/status-sync-run.cjs"
+      - "scripts/test-status-sync-run.cjs"
       - ".github/workflows/status.yml"
       - ".github/workflows/status-resync.yml"
 
@@ -40,3 +41,6 @@ jobs:
 
       - name: Run deriveStatusFeedXml() fixture tests
         run: node scripts/test-status-feed-derive.cjs
+
+      - name: Run bumpStatusSitemapLastmods() fixture tests
+        run: node scripts/test-status-sync-run.cjs
