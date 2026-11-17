@@ -24,6 +24,7 @@ const STATUS_FILE = 'site/public/status.json';
 const STATUS_FEED_FILE = 'site/public/status-feed.xml';
 const SITEMAP_FILE = 'site/public/sitemap.xml';
 const STATUS_FEED_LOC = 'https://quineworks.com/status-feed.xml';
+const STATUS_LOC = 'https://quineworks.com/status';
 const SYNC_BRANCH = 'status-sync';
 const REPOS = ['quineworks/platform', 'quineworks/tax-lane'];
 
@@ -56,6 +57,25 @@ function severityDownFromLabels(labels) {
 
 function isLiveIncidentFromLabels(labels) {
   return (labels || []).some((l) => l.name === 'live-incident');
+}
+
+// platform#3687: pure helper for the sitemap-bump decision in step 6 of
+// run() below, pulled out so it's unit-testable without shelling out to
+// `gh`. By the time run() reaches step 6, status.json's content has
+// unconditionally changed (the early return earlier in run() already
+// filtered out no-op runs) -- status.html is a static shell that renders
+// status.json client-side (site/public/status.html:561), so its own
+// crawlable content changes exactly when status.json does, same as
+// status-feed.xml's. So STATUS_LOC's lastmod always gets bumped here;
+// STATUS_FEED_LOC's stays conditional on feedChanged since its own
+// rendered content doesn't always move in lockstep with status.json's
+// (see putIfChanged's doc comment above for why).
+function bumpStatusSitemapLastmods(sitemapContent, { feedChanged, today }) {
+  let next = bumpLastmod(sitemapContent, STATUS_LOC, today);
+  if (feedChanged) {
+    next = bumpLastmod(next, STATUS_FEED_LOC, today);
+  }
+  return next;
 }
 
 // A status.json incident url is always a GitHub issue html_url
@@ -243,26 +263,25 @@ async function run({ triggerIssueRaw }) {
   putIfChanged(STATUS_FILE, newContent, `chore: sync status.json (${triggerDescription}) — platform#1943`);
   const feedChanged = putIfChanged(STATUS_FEED_FILE, newFeedContent, `chore: sync status-feed.xml (${triggerDescription}) — platform#1943/#2349`);
 
-  // 6. sitemap.xml's lastmod for status-feed.xml is hand-maintained like
-  // every other sitemap-lastmod-check.yml-covered page (platform#1830) --
-  // this is the one write path that otherwise always trips that guard on
-  // its own PR (platform#3641/#3642), since nothing in this workflow is a
-  // human who'd remember to bump it by hand. Only runs when
-  // status-feed.xml's content actually changed on the branch above; reads
-  // sitemap.xml fresh off SYNC_BRANCH for the same staleness reason
-  // putIfChanged does.
-  if (feedChanged) {
-    try {
-      const sitemapJson = JSON.parse(gh(['api', `repos/${STATUS_REPO}/contents/${SITEMAP_FILE}?ref=${SYNC_BRANCH}`]));
-      const sitemapContent = Buffer.from(sitemapJson.content, 'base64').toString('utf8');
-      const bumpedSitemap = bumpLastmod(sitemapContent, STATUS_FEED_LOC, now.slice(0, 10));
-      putIfChanged(SITEMAP_FILE, bumpedSitemap, `chore: bump sitemap lastmod for status-feed.xml (${triggerDescription}) — platform#1943/#1830`);
-    } catch (e) {
-      // sitemap.xml always exists on main/the branch in practice; an
-      // unreadable fetch just means we skip the lastmod bump this run
-      // rather than risk writing empty content (platform#3651).
-      console.log(`sitemap.xml fetch failed — skipping lastmod bump: ${e.message}`);
-    }
+  // 6. sitemap.xml's lastmod for /status and status-feed.xml is hand-
+  // maintained like every other sitemap-lastmod-check.yml-covered page
+  // (platform#1830) -- this is the one write path that otherwise always
+  // trips that guard on its own PR (platform#3641/#3642/#3687), since
+  // nothing in this workflow is a human who'd remember to bump it by hand.
+  // Always runs (status.json has unconditionally changed by this point --
+  // see bumpStatusSitemapLastmods's doc comment above); reads sitemap.xml
+  // fresh off SYNC_BRANCH for the same staleness reason putIfChanged does.
+  try {
+    const sitemapJson = JSON.parse(gh(['api', `repos/${STATUS_REPO}/contents/${SITEMAP_FILE}?ref=${SYNC_BRANCH}`]));
+    const sitemapContent = Buffer.from(sitemapJson.content, 'base64').toString('utf8');
+    const bumpedSitemap = bumpStatusSitemapLastmods(sitemapContent, { feedChanged, today: now.slice(0, 10) });
+    const bumpedWhat = feedChanged ? 'status.html and status-feed.xml' : 'status.html';
+    putIfChanged(SITEMAP_FILE, bumpedSitemap, `chore: bump sitemap lastmod for ${bumpedWhat} (${triggerDescription}) — platform#1943/#1830/#3687`);
+  } catch (e) {
+    // sitemap.xml always exists on main/the branch in practice; an
+    // unreadable fetch just means we skip the lastmod bump this run
+    // rather than risk writing empty content (platform#3651).
+    console.log(`sitemap.xml fetch failed — skipping lastmod bump: ${e.message}`);
   }
 
   if (existingPr) {
@@ -278,7 +297,7 @@ async function run({ triggerIssueRaw }) {
   }
 }
 
-module.exports = { run };
+module.exports = { run, bumpStatusSitemapLastmods };
 
 if (require.main === module) {
   const raw = process.env.TRIGGER_ISSUE_JSON;
