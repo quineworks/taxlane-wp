@@ -1,0 +1,75 @@
+# #3877: generates the Wondertide host character rig for real, the one
+# step `engineer`/`cto`/`manager` can't do directly -- all three run under
+# the shared `quineworks-agent-task` IAM role, which can only
+# `ListSecrets`/`DescribeSecret` (not `GetSecretValue`) on AWS Secrets
+# Manager, and separately `CLOUDFLARE_API_TOKEN`/`STABILITY_API_KEY`
+# aren't even AWS Secrets Manager entries for the Cloudflare case --
+# `CLOUDFLARE_API_TOKEN` is a GitHub Actions repo secret
+# (infra-plan.yml's `TF_VAR_cloudflare_api_token` already uses it the same
+# way), usable only inside a workflow run like this one, not fetchable by
+# value through any API an agent role could call directly. Manually
+# triggered (not on every push) since this spends real Workers AI/
+# Stability usage and should run deliberately, not on every merge to
+# wondertide/visuals/.
+#
+# Deliberately doesn't commit anything itself -- just generates and
+# uploads the rig as a build artifact. A human or agent downloads it
+# (`gh run download`) and commits it via a normal reviewer-gated PR, same
+# as every other change in this repo.
+name: wondertide-generate-host-rig
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: "Image-gen backend (see wondertide/visuals/README.md's \"Vendor pick\")"
+        required: false
+        default: cloudflare
+        type: choice
+        options: [cloudflare, stability]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wondertide-generate-host-rig
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ondemand-x86_64
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+      STABILITY_API_KEY: ${{ secrets.STABILITY_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # No-root static ffmpeg/ffprobe fetch -- same commands as
+      # wondertide/README.md's "Running the tests without root/apt"
+      # section (this AMI's dnf install list, infra/ci_runner_ondemand_ami.tf,
+      # doesn't bake ffmpeg in).
+      - name: Fetch static ffmpeg/ffprobe
+        run: |
+          npm install --no-save ffmpeg-static
+          echo "FFMPEG_BINARY=$(node -e 'console.log(require("ffmpeg-static"))')" >> "$GITHUB_ENV"
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) JVS_ARCH=amd64 ;;
+            aarch64) JVS_ARCH=arm64 ;;
+            *) JVS_ARCH="$ARCH" ;;
+          esac
+          curl -sL -o ffmpeg-release.tar.xz \
+            "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-${JVS_ARCH}-static.tar.xz"
+          python3 -c "import lzma,shutil; shutil.copyfileobj(lzma.open('ffmpeg-release.tar.xz'), open('ffmpeg-release.tar','wb'))"
+          mkdir ffmpeg-release && tar -xf ffmpeg-release.tar -C ffmpeg-release --strip-components=1
+          echo "FFPROBE_BINARY=$(pwd)/ffmpeg-release/ffprobe" >> "$GITHUB_ENV"
+
+      - name: Generate host rig
+        run: python3 -m wondertide.visuals.cli generate-host --backend "${{ inputs.backend }}" --output-dir "${{ runner.temp }}/host-rig"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wondertide-host-rig
+          path: ${{ runner.temp }}/host-rig/
+          retention-days: 7
