@@ -1,0 +1,28 @@
+# platform#3856: CI coverage for the Wondertide topic-backlog pipeline
+# (`wondertide/lib/*.cjs`, `wondertide/bin/*.cjs`) — path-filtered so it
+# only fires on PRs actually touching the directory. The fixture tests
+# stub out `claude -p` (topic generation + web-search fact vetting) rather
+# than invoking it, so this never spends real Claude usage.
+name: wondertide-tests
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - "wondertide/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wondertide-tests-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run wondertide lib/bin fixture tests
+        run: node --test wondertide/lib/*.test.cjs wondertide/bin/*.test.cjs
