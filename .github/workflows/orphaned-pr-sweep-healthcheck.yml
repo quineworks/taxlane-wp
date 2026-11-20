@@ -91,4 +91,4 @@ jobs:
           fi
 
           echo "orphaned-pr-sweep hasn't completed a run in ${AGE}s (> ${STALE_THRESHOLD_SECONDS}s threshold) -- its schedule trigger likely silently stopped firing (platform#4058). Re-dispatching directly." >&2
-          gh workflow run orphaned-pr-sweep.yml --repo "$REPO"
+          gh workflow run orphaned-pr-sweep.yml --repo "$REPO" --ref main
