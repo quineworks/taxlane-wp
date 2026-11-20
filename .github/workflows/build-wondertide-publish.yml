@@ -1,0 +1,75 @@
+# Builds the Wondertide Fargate publish image (#3851) and pushes it to its
+# own ECR repo. Mirrors build-wondertide-render.yml's shape exactly
+# (OIDC auth, no AWS keys in GitHub) -- separate workflow, separate image,
+# separate ECS task family: this task runs a publish job to completion
+# and exits, it never runs an AGENT_ROLE/Claude Code loop.
+name: build-wondertide-publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "wondertide/**"
+      - ".github/workflows/build-wondertide-publish.yml"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: build-wondertide-publish
+  cancel-in-progress: true
+
+jobs:
+  build:
+    # Native ARM64 build, same reasoning as build-wondertide-render.yml:
+    # the task definition (infra/wondertide_publish_task.tf) runs ARM64
+    # (cheaper on Fargate), so this avoids QEMU cross-emulation.
+    runs-on: ondemand-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions-platform
+          aws-region: us-east-1
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: wondertide
+          file: wondertide/publish/Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          sbom: false
+          tags: ${{ steps.ecr.outputs.registry }}/quineworks-wondertide-publish:latest
+
+      # Same fix as build-wondertide-render.yml's "Pin task definition to
+      # pushed digest" (#11): a `:latest` tag can move mid-pull, so a task
+      # RunTask'd seconds after this build finishes could still resolve to
+      # the prior image. infra/wondertide_publish_task.tf's
+      # container_definitions is `ignore_changes`, so this step (not
+      # `terraform apply`) is what actually reaches the live task
+      # definition.
+      - name: Pin task definition to pushed digest
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/quineworks-wondertide-publish@${{ steps.build.outputs.digest }}
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition quineworks-wondertide-publish \
+            --query 'taskDefinition' > task-def.json
+
+          jq --arg IMAGE "$IMAGE" '
+            .containerDefinitions[0].image = $IMAGE
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes,
+                  .compatibilities, .registeredAt, .registeredBy)
+          ' task-def.json > new-task-def.json
+
+          aws ecs register-task-definition --cli-input-json file://new-task-def.json
