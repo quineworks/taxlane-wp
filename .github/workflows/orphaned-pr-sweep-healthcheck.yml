@@ -1,0 +1,93 @@
+# platform#4058: orphaned-pr-sweep.yml's own `*/15 * * * *` schedule
+# silently stopped firing for 3h20m (13 consecutive missed runs,
+# 2026-11-20T13:42:35Z–17:02:09Z) while event-driven workflows in the same
+# repo (label-enforcer.yml, request-review.yml) ran normally throughout —
+# GitHub's own docs concede scheduled triggers "can be delayed during
+# periods of high load" but give no bound, and this repo's own run volume
+# was elevated for most of that window (the afternoon's fleet-wide
+# usage-limit storm backlog draining). Nothing noticed until a human
+# caught PR#4044 stuck past the sweep's 20-minute threshold and manually
+# `workflow_dispatch`'d it. `ci-sentinel.yml` doesn't cover this class: it
+# only triages a run that *completed* with `conclusion: failure` — a
+# schedule event that never fires produces no run at all, so there is
+# nothing for it to see.
+#
+# This is the backstop for that backstop, same shape as status-resync.yml
+# backstopping status.yml: deliberately *not* relying solely on GitHub's
+# cron delivery to notice GitHub's cron delivery failed, since that would
+# share the exact failure mode it exists to catch. Triggers are `issues`/
+# `pull_request` events (confirmed reliable through the entire #4058 gap,
+# since they're webhook-delivered rather than polled) plus an offset
+# schedule (`5,20,35,50` vs. orphaned-pr-sweep's own `0,15,30,45`) purely
+# as defense-in-depth for a quiet stretch with no issue/PR activity at
+# all — unlikely in this repo, and if it ever happens there's also
+# nothing for orphaned-pr-sweep itself to do yet, so lower urgency.
+#
+# Action on a stale sweep is a direct `workflow_dispatch` re-trigger, not
+# an alert: the harm here is purely "orphaned-pr-sweep didn't run", which
+# a successful re-run fixes completely, same as orphaned-pr-sweep's own
+# recovery action for an individual stuck PR needs no human either. The
+# in-flight check below both prevents piling up duplicate dispatches
+# across repeated firings of this workflow and is what keeps the cadence
+# self-throttling without a DynamoDB dedupe claim (contrast
+# ci-sentinel.yml, which needs one because workflow_run delivery can be
+# redelivered for the same run id — a dispatch here always produces a
+# fresh run id visible to the very next check).
+#
+# Propagates to every product repo the same way orphaned-pr-sweep.yml
+# itself does (sync-governance-workflows.yml + bootstrap-product-repo.sh,
+# not on that script's DENYLIST) — it only ever checks the repo it runs
+# in.
+name: orphaned-pr-sweep-healthcheck
+
+on:
+  schedule:
+    - cron: "5,20,35,50 * * * *"
+  issues:
+    types: [opened, labeled, unlabeled, closed]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+concurrency:
+  group: orphaned-pr-sweep-healthcheck-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  healthcheck:
+    runs-on: ondemand-x86_64
+    steps:
+      - name: Re-dispatch orphaned-pr-sweep if it's gone quiet
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          STALE_THRESHOLD_SECONDS=$((30 * 60))
+          NOW=$(date -u +%s)
+
+          IN_FLIGHT=$(gh api "repos/${REPO}/actions/workflows/orphaned-pr-sweep.yml/runs?per_page=10" \
+            --jq '[.workflow_runs[] | select(.status != "completed")] | length')
+          if [[ "${IN_FLIGHT:-0}" -gt 0 ]]; then
+            echo "orphaned-pr-sweep already has a run queued/in progress -- nothing to do." >&2
+            exit 0
+          fi
+
+          LAST_COMPLETED=$(gh api "repos/${REPO}/actions/workflows/orphaned-pr-sweep.yml/runs?status=completed&per_page=1" \
+            --jq '.workflow_runs[0].created_at')
+          if [[ -z "$LAST_COMPLETED" || "$LAST_COMPLETED" == "null" ]]; then
+            echo "No completed orphaned-pr-sweep run found yet -- skipping." >&2
+            exit 0
+          fi
+
+          LAST_EPOCH=$(date -u -d "$LAST_COMPLETED" +%s)
+          AGE=$((NOW - LAST_EPOCH))
+          if (( AGE < STALE_THRESHOLD_SECONDS )); then
+            echo "orphaned-pr-sweep last completed ${AGE}s ago -- within threshold." >&2
+            exit 0
+          fi
+
+          echo "orphaned-pr-sweep hasn't completed a run in ${AGE}s (> ${STALE_THRESHOLD_SECONDS}s threshold) -- its schedule trigger likely silently stopped firing (platform#4058). Re-dispatching directly." >&2
+          gh workflow run orphaned-pr-sweep.yml --repo "$REPO"

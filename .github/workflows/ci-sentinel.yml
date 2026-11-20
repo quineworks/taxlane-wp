@@ -34,7 +34,14 @@
 # status/label-enforcer) and issue-close-enforcer (its `pull_request`
 # trigger is `types: [closed]`, i.e. post-merge — it cannot block a merge,
 # so despite also having a `pull_request` trigger it isn't a real PR gate
-# and needed to be added here, not excluded below). Deliberately left out:
+# and needed to be added here, not excluded below). platform#4058: also
+# added orphaned-pr-sweep and status-resync (both schedule-triggered, no
+# PR gate, same category as the rest of this list — fit the inclusion
+# criteria above and had simply drifted off it) plus orphaned-pr-sweep's
+# new sibling orphaned-pr-sweep-healthcheck. None of the three would have
+# caught #4058 itself — that was a schedule event never firing at all,
+# producing no run for workflow_run to see — but a real script bug in
+# any of them should still page someone. Deliberately left out:
 # workflows already gated on a *pre-merge* `pull_request` check
 # (closing-keyword-check, commitment-ledger-check, cost-gate-check,
 # no-security-theater, operator-boundary-check,
@@ -66,6 +73,9 @@ on:
         e2e-barcode-scan,
         e2e-storefront-order-verify,
         status,
+        status-resync,
+        orphaned-pr-sweep,
+        orphaned-pr-sweep-healthcheck,
         sync-governance-workflows,
         tracking-parent-auto-closer,
         issue-close-enforcer,
