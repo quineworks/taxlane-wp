@@ -194,6 +194,30 @@ test('llms.txt-only touch with bumped lastmod -> no violation', () => {
   assert.deepEqual(result.violations, []);
 });
 
+// platform#3944: about.html is listed in sitemap.xml (shipped with the
+// /about page, #3773) so it belongs in PAGE_TO_LOC like feed.xml,
+// status-feed.xml, and llms.txt above.
+test('about.html-only touch with unbumped lastmod -> violation naming about.html', () => {
+  const withAbout = SITEMAP_BASE.replace(
+    '</urlset>',
+    '  <url>\n    <loc>https://quineworks.com/about</loc>\n    <lastmod>2026-07-30</lastmod>\n  </url>\n</urlset>',
+  );
+  const result = findLastmodViolations(['site/public/about.html'], withAbout, withAbout, TODAY);
+  assert.equal(result.violations.length, 1);
+  assert.equal(result.violations[0].file, 'site/public/about.html');
+  assert.equal(result.violations[0].loc, 'https://quineworks.com/about');
+});
+
+test('about.html-only touch with bumped lastmod -> no violation', () => {
+  const withAboutBase = SITEMAP_BASE.replace(
+    '</urlset>',
+    '  <url>\n    <loc>https://quineworks.com/about</loc>\n    <lastmod>2026-07-30</lastmod>\n  </url>\n</urlset>',
+  );
+  const withAboutHead = bumped(withAboutBase, 'https://quineworks.com/about', '2026-08-01');
+  const result = findLastmodViolations(['site/public/about.html'], withAboutBase, withAboutHead, TODAY);
+  assert.deepEqual(result.violations, []);
+});
+
 test('unchanged lastmod that is not today (even if some other stale date) still violates', () => {
   const staleBoth = bumped(SITEMAP_BASE, 'https://quineworks.com/changelog', '2026-08-02');
   const result = findLastmodViolations(['site/public/changelog.html'], staleBoth, staleBoth, TODAY);

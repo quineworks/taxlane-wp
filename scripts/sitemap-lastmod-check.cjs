@@ -18,6 +18,7 @@ const PAGE_TO_LOC = {
   'site/public/embed.html': 'https://quineworks.com/embed',
   'site/public/changelog.html': 'https://quineworks.com/changelog',
   'site/public/status.html': 'https://quineworks.com/status',
+  'site/public/about.html': 'https://quineworks.com/about',
   'site/public/feed.xml': 'https://quineworks.com/feed.xml',
   'site/public/status-feed.xml': 'https://quineworks.com/status-feed.xml',
   'site/public/llms.txt': 'https://quineworks.com/llms.txt',
