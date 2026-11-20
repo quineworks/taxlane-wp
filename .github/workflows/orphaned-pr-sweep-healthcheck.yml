@@ -51,6 +51,7 @@ on:
 
 permissions:
   actions: write
+  contents: read
 
 concurrency:
   group: orphaned-pr-sweep-healthcheck-${{ github.repository }}
