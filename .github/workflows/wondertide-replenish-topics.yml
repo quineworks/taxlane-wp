@@ -1,0 +1,122 @@
+# platform#3977 (follow-up from #3974): nothing currently runs
+# `replenish-topics.cjs` on a schedule and commits the result -- today the
+# only way a topic-backlog change under wondertide/data/topics/ survives a
+# container exiting is if some unrelated PR happens to run the script and
+# remembers to commit the data file too (#3947's integration run did this
+# incidentally, in PR#3973). This workflow is the dedicated, scheduled fix.
+#
+# #3856 already closed the storage-backend question ("pick whichever is
+# simplest given existing infra, no new vendor needed" -- plain git-tracked
+# JSON under wondertide/data/topics/<niche-id>.json, see lib/store.cjs's own
+# header). So this workflow's only job is operational: run
+# `replenish-topics.cjs --all` daily, and if that produces a diff, open a
+# normal PR with it -- never commit straight to `main` (this repo's merge
+# ruleset requires green CI + reviewer approval, `bypass_actors: []`, same
+# as every other repo here). A niche already at/above the target queue
+# depth is a true no-op (replenishNiche's own `while` guard), so a run that
+# finds nothing to do produces no diff and no PR, same as the other
+# scheduled loops in this repo (orphaned-pr-sweep/status-resync).
+#
+# Needs a real PAT (not the default per-run `GITHUB_TOKEN`) to push a
+# branch and open the PR: GitHub silently skips `pull_request` events
+# triggered by the default token, which would mean request-review.yml never
+# enqueues a reviewer for it. Same cross-repo-token broker pattern
+# status-resync.yml/sync-governance-workflows.yml already use, scoped to
+# the narrower `github_actions_platform` role since this workflow only ever
+# runs in this repo.
+#
+# `replenish-topics.cjs` -> `lib/generate-topics.cjs`/`lib/vet-topic.cjs`
+# both shell out to a real `claude -p` call (topic generation, then
+# web-search fact-vetting) via `lib/claude-print.cjs` -- the only "Claude
+# API access"/"web-search tool" this fleet's containers carry at all (that
+# file's own header comment explains why: no ANTHROPIC_API_KEY secret
+# exists anywhere in infra/). The CI runner AMI has neither the `claude`
+# CLI nor CLAUDE_CODE_OAUTH_TOKEN baked in, so both are wired here: the CLI
+# via a plain `npm install -g`, and the token via a new
+# `CLAUDE_CODE_OAUTH_TOKEN` GitHub Actions repo secret, following the exact
+# same "new GH Actions secret, not an AWS Secrets Manager read" pattern
+# wondertide-generate-host-rig.yml already set for STABILITY_API_KEY/
+# CLOUDFLARE_API_TOKEN (the agent-task IAM role this would otherwise want
+# to use can only ListSecrets/DescribeSecret, never GetSecretValue, on AWS
+# Secrets Manager -- see that workflow's own header). The secret has to be
+# mirrored in from the existing `claude_oauth_token` field (AWS Secrets
+# Manager `quineworks/app-secrets`, via the secrets-broker) by whoever has
+# break-glass read access -- it is NOT set by this PR.
+name: wondertide-replenish-topics
+
+on:
+  schedule:
+    - cron: "34 5 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: wondertide-replenish-topics
+  cancel-in-progress: false
+
+jobs:
+  replenish:
+    runs-on: ondemand-x86_64
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions-platform
+          aws-region: us-east-1
+
+      - name: Fetch cross-repo GitHub token
+        # Same broker read sync-governance-workflows.yml/status-resync.yml
+        # already use -- see either one's own comment for why this needs a
+        # real PAT rather than the default `GITHUB_TOKEN`.
+        run: |
+          BROKER_RESPONSE=$(curl -fsS \
+            --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+            --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" \
+            -H "x-amz-security-token: ${AWS_SESSION_TOKEN}" \
+            "https://r4c8q4snw0.execute-api.us-east-1.amazonaws.com/secret?field=github_token")
+          GITHUB_PAT=$(jq -r '.value' <<<"$BROKER_RESPONSE")
+          echo "::add-mask::${GITHUB_PAT}"
+          echo "GH_TOKEN=${GITHUB_PAT}" >> "$GITHUB_ENV"
+
+      - name: Configure git identity and push auth
+        run: |
+          git config --global user.name "quineworks"
+          git config --global user.email "quineworks@gmail.com"
+          gh auth setup-git
+
+      - name: Install claude CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Replenish every niche's topic backlog
+        run: node wondertide/bin/replenish-topics.cjs --all --target 12
+
+      - name: Check for a topic-backlog diff
+        id: diff
+        run: |
+          if git status --porcelain -- wondertide/data/topics/ | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No topic-backlog changes -- every niche already at/above its target queue depth." >&2
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open a PR with the replenished backlog
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          BRANCH="wondertide/replenish-topics-$(date -u +%Y%m%d-%H%M%S)"
+          git checkout -b "$BRANCH"
+          git add wondertide/data/topics/
+          git commit -m $'wondertide: scheduled topic-backlog replenishment\n\nPart of #3977'
+          git push origin "$BRANCH"
+          gh pr create \
+            --repo "${{ github.repository }}" \
+            --base main \
+            --head "$BRANCH" \
+            --title "wondertide: scheduled topic-backlog replenishment" \
+            --body "$(printf 'Automated run of `replenish-topics.cjs --all --target 12` (wondertide-replenish-topics.yml, `%s`). Tops up any niche whose queue dropped below its target depth with freshly generated, fact-vetted topics.\n\nPart of #3977' "$(date -u +%Y-%m-%dT%H:%M:%SZ)")"
