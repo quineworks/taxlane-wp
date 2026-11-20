@@ -1,0 +1,96 @@
+# #4017: generates + headlessly verifies the Wondertide 3D host character
+# asset (MakeHuman/MPFB2 base mesh + Mixamo-standard rig + 4 narrator
+# animation clips -- see wondertide/assets3d/README.md for the full
+# writeup, including why Mixamo.com's own service isn't used here).
+#
+# `bpy` (Blender as a pip package) only ships Linux wheels for x86_64
+# (confirmed directly: no manylinux aarch64 wheel exists on PyPI for any
+# `bpy` release as of 2026-11-20) -- same architecture gotcha #4018 found
+# for the existing ARM64 `wondertide-render` Fargate task, so this runs on
+# `ondemand-x86_64`, not the `ondemand-arm64` variant most other Wondertide
+# jobs use.
+#
+# Runs `bpy` inside a plain `python:3.11-slim` (Debian) container, not
+# directly on the AL2023 runner host: the runner AMI has no `sudo`/root for
+# the job user, and AL2023's `dnf` package set doesn't carry some of the X11/
+# SDL2 shared libs `bpy`'s wheel links against under its own names (tried
+# first, see this PR's description) -- Debian's `apt` has all of them under
+# well-known names, and the runner's `docker` group membership gives real
+# root *inside* the container with no host-level privilege needed.
+#
+# Manually triggered, like wondertide-generate-host-rig.yml -- this is a
+# generation step, not a check, and deliberately doesn't commit anything
+# itself: it uploads the generated .blend + proof-render PNG as a build
+# artifact for a human/agent to `gh run download` and commit via a normal
+# reviewer-gated PR, same pattern as that workflow.
+name: wondertide-generate-host-3d
+
+on:
+  workflow_dispatch:
+    inputs:
+      bpy_version:
+        description: "Pinned bpy (Blender) version -- see README.md for why 4.2.x"
+        required: false
+        default: "4.2.23"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: wondertide-generate-host-3d
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch MPFB2 (build-time tool only -- its GPLv3 code is never committed, only its CC0 output)
+        run: |
+          curl -sL -o mpfb2.tar.gz \
+            "https://github.com/makehumancommunity/mpfb2/archive/refs/tags/v2.0.18.tar.gz"
+          mkdir mpfb2-checkout
+          tar -xzf mpfb2.tar.gz -C mpfb2-checkout --strip-components=1
+
+      - name: Build bpy container (Debian apt has well-known names for bpy's X11/SDL2 runtime libs)
+        run: |
+          cat > Dockerfile.bpy <<'EOF'
+          FROM python:3.11-slim
+          RUN apt-get update && apt-get install -y --no-install-recommends \
+                libxi6 libxrender1 libxrandr2 libxfixes3 libxcursor1 \
+                libxinerama1 libxxf86vm1 libsdl2-2.0-0 libgl1 libglx-mesa0 \
+                libxkbcommon0 libsm6 libxext6 libgomp1 \
+              && rm -rf /var/lib/apt/lists/*
+          ARG BPY_VERSION
+          RUN pip install --no-cache-dir "bpy==${BPY_VERSION}"
+          EOF
+          docker build -f Dockerfile.bpy --build-arg BPY_VERSION="${{ inputs.bpy_version || '4.2.23' }}" -t wondertide-bpy .
+
+      - name: Generate host asset (containerized bpy)
+        run: |
+          mkdir -p "${{ runner.temp }}/host-3d"
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -v "${{ runner.temp }}/host-3d:/out" \
+            -e MPFB2_CHECKOUT=/work/mpfb2-checkout \
+            -w /work \
+            wondertide-bpy \
+            python3 wondertide/assets3d/generate_host.py --output /out/host.blend
+
+      - name: Verify headless load + playback + proof render (containerized bpy)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/work" \
+            -v "${{ runner.temp }}/host-3d:/out" \
+            -w /work \
+            wondertide-bpy \
+            python3 wondertide/assets3d/verify_host.py \
+              --blend /out/host.blend \
+              --render-frame /out/verify_render_frame.png
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wondertide-host-3d
+          path: ${{ runner.temp }}/host-3d/
+          retention-days: 7
