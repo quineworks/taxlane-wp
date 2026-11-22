@@ -36,6 +36,18 @@
 # #66's explicit constraint -- belt-and-suspenders, since none of those
 # repos define an "e2e" script today anyway, so the discover step's own
 # no-op already covers them in practice.
+#
+# The discover step itself runs on the runner's own pre-installed node
+# (same pattern as every other platform *-check.yml), NOT actions/setup-node
+# -- setup-node's `cache: npm` hard-fails with "Dependencies lock file is
+# not found" whenever repo root has no package-lock.json, which is true for
+# platform itself (no root package.json at all) and would be true for any
+# other repo that hasn't opted in. Running setup-node unconditionally and
+# before discover broke exactly the "unaffected, exits cleanly" guarantee
+# above (caught live on platform's own workflow_dispatch run). setup-node
+# now only runs once discover has confirmed the repo is actually ready to
+# `npm ci`/`npm run e2e`, which is also the only point a lock file is
+# guaranteed to exist.
 name: post-deploy-e2e
 
 on:
@@ -62,11 +74,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
 
       - name: Discover this repo's e2e script + opt-in live URL
         id: discover
@@ -117,6 +124,12 @@ jobs:
           console.log(`Discovered: "e2e" script present, live URL ${liveUrl}, env var ${envVarName}.`);
           NODE_EOF
           node /tmp/discover-e2e.js
+
+      - uses: actions/setup-node@v4
+        if: steps.discover.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: npm
 
       - name: Install dependencies
         if: steps.discover.outputs.ready == 'true'
