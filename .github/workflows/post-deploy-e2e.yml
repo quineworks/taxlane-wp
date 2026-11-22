@@ -1,0 +1,141 @@
+# platform#4156 (sub-issue of blinkblocks#66): BlinkBlocks has a real-
+# browser E2E suite (qa/e2e-play.cjs, blinkblocks#13/#22) that only runs on
+# PRs via .github/workflows/e2e.yml, against a local dist/ build -- nothing
+# re-ran it against the actual live site after a deploy. This workflow
+# closes that gap generically: any repo with its own web-deploy.yml (exact
+# name), an "e2e" npm script, and an opted-in package.json field gets the
+# same live-site check for free, with no edits to this file.
+#
+# Deliberately the "run" half only (mirrors qa-fixtures-run.yml /
+# qa-fixtures-wake.yml's own split, platform#2338/#2339): this job's own
+# PASS/FAIL status is the signal; a separate sibling sub-issue
+# (wake-on-failure + Terraform IAM grant) reacts to a failure the same way
+# qa-fixtures-wake.yml reacts to qa-fixtures-run.yml -- not built here.
+#
+# Propagated to every live product repo (including blinkblocks) by
+# sync-governance-workflows.yml + bootstrap-product-repo.sh on the next
+# merge to platform's main -- NOT added to that script's DENYLIST, since
+# (like qa-fixtures-run.yml) this file must run in every product repo, not
+# just platform.
+#
+# Opt-in field is "e2eLiveUrl" in a repo's own package.json (e.g.
+# blinkblocks's own "https://blinkblocks.com") -- chosen so a repo's live
+# URL lives right next to the "e2e" script it's paired with, rather than a
+# separate config file or a hardcoded secret. A repo missing either the
+# "e2e" script or this field is unaffected: the discover step below exits
+# cleanly (job succeeds, not fails), not an error.
+#
+# The env var qa/e2e-play.cjs itself reads (BLINKBLOCKS_E2E_URL) is derived
+# generically from the repo name (uppercase, non-alphanumeric -> "_",
+# suffixed "_E2E_URL") rather than hardcoded here, so a future canvas/game
+# repo's own differently-named env var just works without touching this
+# file -- zero blinkblocks-specific naming anywhere below.
+#
+# TaxLane dev freeze (CEO directive 2026-11-10, platform#3590/#3592): same
+# three-repo skip-list qa-fixtures-wake.yml already carries, per blinkblocks
+# #66's explicit constraint -- belt-and-suspenders, since none of those
+# repos define an "e2e" script today anyway, so the discover step's own
+# no-op already covers them in practice.
+name: post-deploy-e2e
+
+on:
+  workflow_run:
+    workflows: [web-deploy]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: post-deploy-e2e-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: post-deploy-e2e
+    if: |
+      (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') &&
+      !contains(fromJSON('["quineworks/tax-lane", "quineworks/taxlane-wp", "quineworks/taxlane-php"]'), github.repository)
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Discover this repo's e2e script + opt-in live URL
+        id: discover
+        run: |
+          cat > /tmp/discover-e2e.js <<'NODE_EOF'
+          'use strict';
+          const fs = require('fs');
+
+          let pkg;
+          try {
+            pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          } catch (e) {
+            console.log('No readable package.json at repo root -- nothing to run, exiting cleanly.');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'ready=false\n');
+            process.exit(0);
+          }
+
+          const e2eScript = pkg.scripts && pkg.scripts.e2e;
+          if (!e2eScript) {
+            console.log('No "e2e" script in package.json -- nothing to run, exiting cleanly.');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'ready=false\n');
+            process.exit(0);
+          }
+
+          const liveUrl = pkg.e2eLiveUrl;
+          if (!liveUrl) {
+            console.log('No "e2eLiveUrl" in package.json -- repo has not opted in yet, exiting cleanly.');
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, 'ready=false\n');
+            process.exit(0);
+          }
+
+          const hasPlaywright = Boolean(
+            (pkg.dependencies && pkg.dependencies.playwright) ||
+              (pkg.devDependencies && pkg.devDependencies.playwright),
+          );
+
+          // Matches the exact shape qa/e2e-play.cjs's own header comment
+          // documents (BLINKBLOCKS_E2E_URL for the blinkblocks repo) --
+          // derived generically so a future repo's own differently-named
+          // env var still lines up, with no edit here.
+          const repoName = process.env.GITHUB_REPOSITORY.split('/')[1];
+          const envVarName = `${repoName.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_E2E_URL`;
+
+          fs.appendFileSync(
+            process.env.GITHUB_OUTPUT,
+            `ready=true\nhas_playwright=${hasPlaywright}\nenv_var_name=${envVarName}\nlive_url=${liveUrl}\n`,
+          );
+          console.log(`Discovered: "e2e" script present, live URL ${liveUrl}, env var ${envVarName}.`);
+          NODE_EOF
+          node /tmp/discover-e2e.js
+
+      - name: Install dependencies
+        if: steps.discover.outputs.ready == 'true'
+        env:
+          # Matches e2e.yml's own install: qa/lib/chromium-launch.cjs-style
+          # suites launch @sparticuz/chromium-min, not Playwright's bundled
+          # browser, so there's no reason to spend time downloading one here.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+        run: npm ci
+
+      - name: Install Playwright's ffmpeg (for recordVideo; no browser needed)
+        if: steps.discover.outputs.ready == 'true' && steps.discover.outputs.has_playwright == 'true'
+        run: npx playwright install ffmpeg
+
+      - name: Run live E2E against the deployed site
+        if: steps.discover.outputs.ready == 'true'
+        env:
+          E2E_ENV_VAR_NAME: ${{ steps.discover.outputs.env_var_name }}
+          E2E_LIVE_URL: ${{ steps.discover.outputs.live_url }}
+        run: |
+          export "${E2E_ENV_VAR_NAME}=${E2E_LIVE_URL}"
+          npm run e2e
