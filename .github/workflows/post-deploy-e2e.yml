@@ -48,7 +48,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: post-deploy-e2e-${{ github.repository }}
+  group: post-deploy-e2e-${{ github.repository }}-${{ github.event.workflow_run.head_sha || github.sha }}
   cancel-in-progress: true
 
 jobs:
