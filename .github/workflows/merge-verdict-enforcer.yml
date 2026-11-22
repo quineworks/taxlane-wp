@@ -1,0 +1,175 @@
+# Post-merge safety net for platform#4215/#4220, same shape as
+# `issue-close-enforcer.yml` (#522): that incident found PR#4187 merged
+# with **zero** commit statuses on its head SHA — `quineworks/review-verdict`
+# was never set. Root cause (confirmed in #4215/platform#4180's own
+# after-the-fact admission): the normal `request-review.yml` ->
+# Actions-dispatched-reviewer path was wedged on a stuck Actions run, an
+# engineer dispatched a fresh reviewer job directly via the same SQS queue
+# `request-review.yml`/`orphaned-pr-sweep.yml` use to route around the
+# stall (the right half of the recovery), then merged the PR itself a few
+# minutes later rather than waiting for that dispatched job's verdict — a
+# violation of every role file's "you don't merge, reviewer does" rule
+# (agent/roles/engineer.md, cto.md, devops.md, chief-of-staff.md all now
+# spell this out with zero discretion, referencing this same incident).
+#
+# GitHub's own branch-protection ruleset can't be the backstop here — the
+# org fell off the paid plan and every repo's ruleset is confirmed
+# structurally inert (`rulesets` API 403s "Upgrade to GitHub Pro", see
+# `memory/project_github_pro_lapse_rulesets_inert.md`; CEO has explicitly
+# declined to restore it, platform#2408/tax-lane#1386 closed won't-fix,
+# not to be re-raised). Nothing on GitHub's side stops any agent's shared
+# token from calling `gh pr merge` on any PR regardless of CI/status state
+# — the whole system runs on every role's own self-discipline instead.
+# This workflow is the company-authored, agent/process-level detective
+# control for when that discipline fails anyway: it can't block the merge
+# (same plan limitation), but it guarantees a bypass is never again only
+# caught by someone happening to investigate afterward (#4215 was exactly
+# that — a lucky catch, not a structural one) by flagging it the instant
+# the merge event fires and routing it to `cto` automatically, same
+# pattern `issue-close-enforcer.yml` already uses for a different merge-
+# time gap.
+#
+# Only fires on `pull_request: closed` gated on `.merged == true` — an
+# unmerged close (abandoned PR) carries no review-verdict expectation at
+# all. Checks the head SHA's commit statuses (Statuses API, the same one
+# `agent/roles/reviewer.md`'s merge step itself writes to) for a `success`
+# `quineworks/review-verdict` entry; anything else (missing entirely,
+# `pending`, `failure`, `error`) means this PR landed without the
+# obligations that status is supposed to guarantee.
+#
+# The `merge-missing-verdict` label doubles as this workflow's own dedupe
+# state (same idea as `needs-close-check`/`needs-label` elsewhere in this
+# repo) — a redelivered `closed` webhook for the same PR is a no-op once
+# already flagged.
+#
+# Propagated to every product repo by sync-governance-workflows.yml +
+# bootstrap-product-repo.sh (not added to that script's DENYLIST — merges
+# without a recorded verdict can happen in any repo with open PRs, platform
+# included, same shape as issue-close-enforcer.yml/orphaned-pr-sweep.yml
+# themselves).
+name: merge-verdict-enforcer
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  id-token: write
+  contents: read
+  issues: write
+  pull-requests: write
+  # Reading the Statuses API (not the Checks API) needs this explicitly --
+  # issues/pull-requests write doesn't cover it (same gap orphaned-pr-
+  # sweep.yml hit for check-suites, requiring its own `checks: read`).
+  statuses: read
+
+concurrency:
+  group: merge-verdict-enforcer-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  enforce:
+    runs-on: ondemand-x86_64
+    if: github.event.pull_request.merged == true
+    steps:
+      - name: Ensure the merge-missing-verdict marker exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
+
+          if ! retry gh label create merge-missing-verdict \
+            --repo "$REPO" \
+            --color b60205 \
+            --description "PR merged without a successful quineworks/review-verdict status on its head SHA — platform#4215/#4220" \
+            --force; then
+            echo "::error::gh label create failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+
+      - name: Check the merged head SHA for a recorded review verdict
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Zero statuses at all and "statuses exist but none are our
+          # context" both count as missing -- either way the obligation
+          # reviewer.md's merge step carries (set-status-then-merge) wasn't
+          # met on this commit.
+          STATE=$(gh api "repos/${REPO}/commits/${SHA}/status" \
+            --jq '.statuses[]? | select(.context == "quineworks/review-verdict") | .state' \
+            2>/dev/null | head -1 || true)
+          echo "Observed quineworks/review-verdict state on ${SHA}: '${STATE:-none}'" >&2
+          if [[ "$STATE" != "success" ]]; then
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Flag the merge
+        id: flag
+        if: steps.check.outputs.missing == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          retry() {
+            for attempt in 1 2 3 4 5; do
+              "$@" && return 0
+              sleep $((attempt * 3))
+            done
+            return 1
+          }
+
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")' 2>/dev/null || echo "")
+          if echo ",${LABELS}," | grep -q ',merge-missing-verdict,'; then
+            echo "Already flagged -- skipping duplicate (redelivered event)." >&2
+            echo "newly_flagged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! retry gh pr edit "$PR_NUMBER" --repo "$REPO" --add-label merge-missing-verdict; then
+            echo "::error::gh pr edit --add-label failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          if ! retry gh pr comment "$PR_NUMBER" --repo "$REPO" --body \
+            "This PR merged with no successful \`quineworks/review-verdict\` status on its head SHA — no recorded reviewer verdict, review comment, or review object exists for the commit that landed. Flagged automatically (platform#4215/#4220's post-merge safety net); routing to \`cto\` to confirm whether a post-hoc review is still needed and whether this needs further remediation."; then
+            echo "::error::gh pr comment failed after 5 attempts (transient GitHub API 5xx)" >&2
+            exit 1
+          fi
+          echo "newly_flagged=true" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        if: steps.flag.outputs.newly_flagged == 'true'
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Enqueue cto triage job
+        if: steps.flag.outputs.newly_flagged == 'true'
+        env:
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        # chat_id must match var.ceo_chat_ids in infra/variables.tf — GitHub
+        # Actions has no read access to Terraform state, so this list is
+        # kept in sync by hand (same note as request-review.yml/
+        # label-enforcer.yml/issue-close-enforcer.yml).
+        run: |
+          BODY=$(jq -n \
+            --arg ctx "PR ${PR_URL} (#${PR_NUMBER} in ${REPO}: ${PR_TITLE}) merged with no successful quineworks/review-verdict status on its head SHA -- merge-verdict-enforcer.yml flagged it with merge-missing-verdict (platform#4215/#4220's post-merge safety net). Do a post-hoc code review of the merged diff (same treatment #4215's reviewer gave PR#4187) and confirm whether it's sound; if not, open a follow-up fix/revert PR through the normal review path. Also check whether this is a repeat of the #4215/#4220 bypass pattern (an ad hoc direct-SQS reviewer dispatch followed by a self-merge, rather than waiting for that dispatched job's verdict) and if so treat it as a boundary violation worth a closer look, not just a one-off." \
+            '{role: "cto", context: $ctx, chat_id: "1952896608,5209713934", depth: 0}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
