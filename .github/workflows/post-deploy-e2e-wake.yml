@@ -1,0 +1,169 @@
+# platform#4157 (sub-issue of blinkblocks#66, sibling of #4156): #4156's
+# post-deploy-e2e.yml runs any opted-in repo's own "e2e" script against its
+# just-deployed live site and surfaces PASS/FAIL as its own job status, but
+# nothing woke anyone on a real failure -- it just sat red like any other
+# job, depending on someone noticing.
+#
+# Mirrors qa-fixtures-wake.yml (platform#2339) and its Terraform grant
+# (infra/qa_fixtures_wake.tf) verbatim in structure: same
+# workflow_run -> DynamoDB dedupe-claim -> `aws sqs send-message` pattern,
+# same role, same table, same queue, same TaxLane skip-list. The one
+# required difference, per #4157's own explicit constraint: a *new* dedupe
+# key prefix (post-deploy-e2e-wake-run-*, infra/post_deploy_e2e_wake.tf)
+# rather than reusing qa-fixtures-wake-run-* -- these two workflows dedupe
+# against disjoint sets of workflow_run ids (different triggering
+# workflow), so sharing a key namespace would only make either workflow's
+# runs more surprising to inspect/clear by hand later, same reasoning that
+# workflow's own header gives for not sharing ci-sentinel's prefix.
+#
+# The failure-output extraction below is its own, separate grep, NOT a
+# reuse of qa-fixtures-wake.yml's render-interact-shaped
+# `Z FAIL:|Z {2,}[^ ]` pattern: qa/e2e-play.cjs (read directly before
+# writing this) logs failures as single self-contained
+# `BUG [<scenario>]: <description> (evidence: ...)` lines (via its own
+# logBug()), not a FAIL: header followed by separately-indented detail
+# lines, and an uncaught error instead logs a `FATAL: <stack>` line
+# followed by the stack trace's own 4-space-indented `at ...` frames. Block
+# boundaries here are therefore "next BUG[]/FATAL: header, or EOF" rather
+# than indentation depth -- but the whole-block byte-cap truncation loop
+# itself (never cut a block partway through, note how many were dropped)
+# is reused verbatim from qa-fixtures-wake.yml, per platform#3130/#3132's
+# lesson that a blind `head -c` silently drops genuine failure detail.
+name: post-deploy-e2e-wake
+
+on:
+  workflow_run:
+    workflows: [post-deploy-e2e]
+    types: [completed]
+
+permissions:
+  id-token: write
+  contents: read
+  # Needed to fetch the triggering run's own job logs below (qa/e2e-play.cjs's
+  # BUG[]/FATAL: output) via `gh run view --log-failed` -- same reason
+  # qa-fixtures-wake.yml needs it.
+  actions: read
+
+jobs:
+  wake:
+    # TaxLane dev freeze (CEO directive 2026-11-10, platform#3590/#3592):
+    # same skip-list qa-fixtures-wake.yml already carries. This file is
+    # synced byte-identical to every product repo by
+    # sync-governance-workflows.yml, so the skip list lives here rather
+    # than per-repo. To lift the freeze once the CEO signals a resume,
+    # drop this clause from the `if:` below.
+    if: |
+      github.event.workflow_run.conclusion == 'failure' &&
+      !contains(fromJSON('["quineworks/tax-lane", "quineworks/taxlane-wp", "quineworks/taxlane-php"]'), github.repository)
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Claim this run id (dedupe)
+        id: claim
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set +e
+          OUT=$(aws dynamodb put-item \
+            --table-name quineworks-state \
+            --item "{\"pk\": {\"S\": \"post-deploy-e2e-wake-run-${RUN_ID}\"}}" \
+            --condition-expression "attribute_not_exists(pk)" 2>&1)
+          STATUS=$?
+          set -e
+
+          if [[ $STATUS -eq 0 ]]; then
+            echo "claimed=true" >> "$GITHUB_OUTPUT"
+          elif [[ "$OUT" == *ConditionalCheckFailedException* ]]; then
+            echo "claimed=false" >> "$GITHUB_OUTPUT"
+            echo "Run ${RUN_ID} already claimed — skipping duplicate enqueue" >&2
+          else
+            echo "$OUT" >&2
+            exit "$STATUS"
+          fi
+
+      - name: Enqueue qa fix job
+        if: steps.claim.outputs.claimed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set +e
+          LOG=$(gh run view "$RUN_ID" --repo "$REPO" --log-failed 2>&1)
+          set -e
+          # qa/e2e-play.cjs's logBug() prints one self-contained
+          # "BUG [<scenario>]: <description> (evidence: ...)" line per
+          # failure (no separately-indented detail lines -- the evidence
+          # is already inline), and an uncaught error instead prints a
+          # "FATAL: <stack-first-line>" header followed by the stack
+          # trace's own 4-space-indented "at ..." frames. A GitHub Actions
+          # log line is always "<timestamp>Z <content>" with exactly one
+          # separating space (confirmed against qa-fixtures-wake.yml's own
+          # real-run evidence for this same runner/log shape), so a BUG
+          # header reads "...Z BUG [...` and a FATAL stack frame reads
+          # "...Z     at ..." (that one separator plus the stack trace's
+          # own 4-space indent). Matching on these two literal headers,
+          # rather than qa-fixtures-wake.yml's render-interact-shaped
+          # FAIL:/indent pattern, matters: this script's shape is simply
+          # different (read directly, not assumed) -- reusing the wrong
+          # pattern here would silently extract nothing.
+          #
+          # Capped at 40000 bytes, same as qa-fixtures-wake.yml and for
+          # the same reason: comfortably under SQS's 256KB message limit
+          # with room to spare. Truncation is whole-block (a BUG line, or
+          # a FATAL header plus its stack frames, up to the next header or
+          # EOF) so a block is never cut partway through -- per
+          # platform#3130/#3132's lesson that a blind `head -c` can
+          # silently drop genuine failure detail.
+          # grep exits 1 on zero matches (e.g. the triggering failure was
+          # an npm ci blip/checkout failure before qa/e2e-play.cjs ever
+          # ran), which would kill this step under the default set -eo
+          # pipefail and skip the enqueue entirely -- guard it like LOG=
+          # above.
+          set +e
+          FAIL_TEXT=$(echo "$LOG" | grep -E 'Z (BUG \[|FATAL:)|Z {4,}at ')
+          set -e
+          CAP=40000
+
+          if [[ $(wc -c <<< "$FAIL_TEXT") -le $CAP ]]; then
+            QA_OUTPUT="$FAIL_TEXT"
+          else
+            mapfile -t STARTS < <(grep -nE 'Z (BUG \[|FATAL:)' <<< "$FAIL_TEXT" | cut -d: -f1)
+            TOTAL_BLOCKS=${#STARTS[@]}
+            TOTAL_LINES=$(wc -l <<< "$FAIL_TEXT")
+            QA_OUTPUT=""
+            INCLUDED=0
+            for i in "${!STARTS[@]}"; do
+              START=${STARTS[$i]}
+              if [[ $((i + 1)) -lt $TOTAL_BLOCKS ]]; then
+                END=$(( STARTS[i + 1] - 1 ))
+              else
+                END=$TOTAL_LINES
+              fi
+              BLOCK=$(sed -n "${START},${END}p" <<< "$FAIL_TEXT")
+              CANDIDATE="${QA_OUTPUT}${BLOCK}"$'\n'
+              if [[ $(wc -c <<< "$CANDIDATE") -gt $CAP && $INCLUDED -gt 0 ]]; then
+                break
+              fi
+              QA_OUTPUT="$CANDIDATE"
+              INCLUDED=$((INCLUDED + 1))
+            done
+            REMAINING=$((TOTAL_BLOCKS - INCLUDED))
+            if [[ $REMAINING -gt 0 ]]; then
+              QA_OUTPUT="${QA_OUTPUT}"$'\n'"+${REMAINING} more failure block(s) truncated, see run URL for full list."
+            fi
+          fi
+
+          BODY=$(jq -n \
+            --arg ctx "post-deploy-e2e failed on ${REPO}@${BRANCH} (${HEAD_SHA:0:7}) — a live e2e check against this repo's deployed site regressed after a real deploy. Run: ${RUN_URL}. qa/e2e-play.cjs output: ${QA_OUTPUT}. This is very likely a real product regression: reproduce it against the deployed live site, find the root cause, and ship a fix PR." \
+            '{role: "qa", context: $ctx, chat_id: "1952896608", depth: 0}')
+          aws sqs send-message \
+            --queue-url https://sqs.us-east-1.amazonaws.com/324568509417/quineworks-work \
+            --message-body "$BODY"
