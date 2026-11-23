@@ -176,6 +176,7 @@ jobs:
       - name: Enqueue job
         if: steps.gate.outputs.run == 'true'
         env:
+          REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
           TARGET: ${{ steps.gate.outputs.target }}
@@ -184,6 +185,17 @@ jobs:
         # Actions has no read access to Terraform state, so this list is
         # kept in sync by hand (same note as request-review.yml/
         # label-enforcer.yml).
+        #
+        # #4223: every CTX below now names `$REPO` explicitly, mirroring
+        # request-review.yml's own #1077 fix for the identical gap -- this
+        # workflow is propagated byte-identical into every product repo
+        # (scripts/bootstrap-product-repo.sh), so a bare PR/issue number
+        # with no repo named left the dispatcher's backpressure marker
+        # (handler.py's _mark_backpressure_queued) with nothing but
+        # GITHUB_REPO to default to, mis-scoping it to platform for every
+        # cross-repo design PR and making pump()'s stalled-PR check
+        # (_is_actively_progressing's `_backpressure_pr_queued` read) blind
+        # to it.
         run: |
           ISSUE_REF=""
           if [[ -n "$ISSUE_NUM" ]]; then
@@ -192,13 +204,13 @@ jobs:
 
           case "$TARGET" in
             product)
-              CTX="Review design PR #${PR_NUMBER}${ISSUE_REF}: ${PR_TITLE}. If satisfied the work is complete, add label \`design-approved\`. If not, post specific revision comments and add label \`design-changes-requested\`."
+              CTX="Review design PR #${PR_NUMBER} in ${REPO}${ISSUE_REF}: ${PR_TITLE}. If satisfied the work is complete, add label \`design-approved\`. If not, post specific revision comments and add label \`design-changes-requested\`."
               ;;
             designer)
-              CTX="Revise design PR #${PR_NUMBER}${ISSUE_REF}: ${PR_TITLE} per product's review comments — read the PR discussion thread for specifics, push fixes to this same branch."
+              CTX="Revise design PR #${PR_NUMBER} in ${REPO}${ISSUE_REF}: ${PR_TITLE} per product's review comments — read the PR discussion thread for specifics, push fixes to this same branch."
               ;;
             reviewer)
-              CTX="Review PR #${PR_NUMBER}: ${PR_TITLE}"
+              CTX="Review PR #${PR_NUMBER} in ${REPO}: ${PR_TITLE}"
               ;;
           esac
 
