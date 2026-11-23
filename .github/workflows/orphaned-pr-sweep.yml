@@ -64,12 +64,38 @@
 # below trades promptness for cost: every 15 minutes, not continuous
 # polling, mirroring the cost-consciousness already applied to this fleet's
 # other scheduled sweeps.
+#
+# platform#4298 (sub-issue of #4295, CEO directive): the stuck-review-
+# outstanding branch above assumed "review-outstanding sat past the
+# threshold with no verdict" always means the dispatched job was lost --
+# but a reviewer that posts its verdict (comment, and for Request-changes
+# the `changes-requested` label) and then crashes/fails *before* reaching
+# the label-clearing step at the end of its run (agent/roles/reviewer.md)
+# leaves review-outstanding stuck in exactly the same shape, with a verdict
+# that already landed on the current head SHA. Redispatching there is pure
+# waste: a second reviewer job re-reviewing a commit that was already
+# judged. Before redispatching, both branches below now check whether the
+# PR's *current* head SHA already carries a verdict and skip the
+# enqueue (just clearing the stale label) if so -- see
+# `verdict_exists_for_sha` and the `needs-ceo-decision` skip. The two
+# `workflow_dispatch` inputs below default to today's real thresholds
+# (20min / 10min) and exist only so this logic can be exercised live via a
+# manual dispatch without waiting out the real clock.
 name: orphaned-pr-sweep
 
 on:
   schedule:
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      stuck_review_threshold_seconds:
+        description: "Override STUCK_REVIEW_THRESHOLD_SECONDS (testing only; defaults to the real 20min)"
+        required: false
+        type: string
+      age_threshold_seconds:
+        description: "Override AGE_THRESHOLD_SECONDS (testing only; defaults to the real 10min)"
+        required: false
+        type: string
 
 permissions:
   id-token: write
@@ -105,11 +131,89 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
+          STUCK_REVIEW_THRESHOLD_INPUT: ${{ inputs.stuck_review_threshold_seconds }}
+          AGE_THRESHOLD_INPUT: ${{ inputs.age_threshold_seconds }}
         run: |
-          AGE_THRESHOLD_SECONDS=$((10 * 60))
-          STUCK_REVIEW_THRESHOLD_SECONDS=$((20 * 60))
+          AGE_THRESHOLD_SECONDS="${AGE_THRESHOLD_INPUT:-$((10 * 60))}"
+          STUCK_REVIEW_THRESHOLD_SECONDS="${STUCK_REVIEW_THRESHOLD_INPUT:-$((20 * 60))}"
           NOW=$(date -u +%s)
           : > /tmp/orphaned-prs.jsonl
+
+          # platform#4298: does the PR's current head SHA already carry a
+          # recorded reviewer verdict? Deliberately does NOT check the
+          # `quineworks/review-verdict` commit status here, even though
+          # reviewer.md's merge step is the only place *the reviewer*
+          # writes it -- live-tested against real PR#4283 (a
+          # `commitment-clear/*` PR, still open on `changes-requested`) and
+          # found `commitment-ledger-check.yml` also writes `success` to
+          # that exact same status context on structural pass, completely
+          # independent of whether the reviewer agent ever ran. Treating
+          # that status's bare presence as "the reviewer already verdicted
+          # this SHA" would have been a false positive on exactly this PR
+          # shape and silently suppressed a redispatch a real stuck review
+          # still needs -- a worse regression than the waste this fix
+          # exists to remove. The one signal that's genuinely
+          # reviewer-exclusive is the label: `changes-requested` is only
+          # ever set by the Request-changes verdict (reviewer.md).
+          #
+          # An earlier version of this function paired that label with "a
+          # PR comment posted after the head commit's timestamp" as the
+          # signal that the verdict covers the *current* SHA. A review pass
+          # on this PR (platform#4300, confirmed via repro against real
+          # `platform#2287` comment history) found that heuristic is wrong:
+          # every agent posts through the same shared GitHub account (see
+          # reviewer.md's note that there's no separate "approval" identity),
+          # so there is no author to distinguish a reviewer's verdict from an
+          # engineer's own routine "pushed a fix, ready for re-review"
+          # comment -- and that engineer comment is the ordinary shape of a
+          # post-push update, not a rare case. Any comment landing after a
+          # fresh push (new head SHA, stale `changes-requested` label still
+          # carried over) would be misread as "already verdicted," clearing
+          # `review-outstanding` with no redispatch and leaving the PR with
+          # only `changes-requested` set -- the state the loop further below
+          # treats as "normal, waiting on a fix push" and permanently skips,
+          # i.e. a silently-stuck-forever PR until some unrelated future push
+          # creates a new SHA.
+          #
+          # Fixed by keying off the `changes-requested` label's own `labeled`
+          # timeline event instead of any comment: that event's timestamp is
+          # set atomically with the Request-changes verdict itself (reviewer.md
+          # posts the comment and applies the label in the same verdict step),
+          # so it is a reviewer-exclusive signal no shared-account comment can
+          # spoof. If the label was last applied *after* the current head
+          # commit was created, the commit already existed at review time, so
+          # the verdict covers it. If the label was last applied *before* the
+          # current head commit, a push landed after the verdict (the
+          # `changes-requested`-carried-over-from-a-stale-SHA case,
+          # request-review.yml's `synchronize` gate also requires
+          # review-outstanding absent, so that push's own re-review got
+          # blocked too) and the verdict does not cover the current SHA.
+          # Escalate verdicts are covered separately above via the
+          # `needs-ceo-decision` label reviewer.md applies directly to the
+          # PR -- not here, since Escalate never sets `changes-requested`
+          # (it removes it if present) and so has no PR-level trace this
+          # function alone could key on. Merge verdicts need no check here
+          # at all: a merged PR is closed and never reaches this open-PRs
+          # loop.
+          verdict_exists_for_sha() {
+            local sha="$1" labels="$2"
+
+            if [[ ",${labels}," != *",changes-requested,"* ]]; then
+              return 1
+            fi
+
+            local commit_date labeled_at
+            commit_date=$(gh api "repos/${REPO}/commits/${sha}" --jq '.commit.committer.date' 2>/dev/null)
+            labeled_at=$(gh api "repos/${REPO}/issues/${NUMBER}/timeline" --paginate \
+              --jq '[.[] | select(.event == "labeled" and .label.name == "changes-requested")] | last | .created_at' 2>/dev/null)
+            if [[ -z "$commit_date" || -z "$labeled_at" || "$labeled_at" == "null" ]]; then
+              return 1
+            fi
+            if (( $(date -u -d "$labeled_at" +%s) > $(date -u -d "$commit_date" +%s) )); then
+              return 0
+            fi
+            return 1
+          }
 
           gh pr list --repo "$REPO" --state open --limit 200 \
             --json number,title,createdAt,isDraft,labels,headRefOid \
@@ -122,6 +226,20 @@ jobs:
             LABELS=$(jq -r '[.labels[].name] | join(",")' <<<"$PR")
 
             if [[ "$IS_DRAFT" == "true" ]]; then
+              continue
+            fi
+
+            # platform#4298: `needs-ceo-decision` is the Escalate verdict's
+            # own PR-level trace (agent/roles/reviewer.md applies it
+            # directly to the PR being reviewed, same label
+            # services/telegram-webhook/handler.py's PARKED_PR_LABELS/
+            # _is_parked already treat as known-stopped elsewhere) --
+            # already-escalated work, not an orphan, regardless of which
+            # branch below would otherwise fire. Checked first since
+            # Escalate clears changes-requested/needs-review/
+            # review-outstanding (so without this, a slow CEO decision
+            # could age past either threshold and get falsely flagged).
+            if [[ ",${LABELS}," == *",needs-ceo-decision,"* ]]; then
               continue
             fi
 
@@ -139,13 +257,20 @@ jobs:
                 LABELED_EPOCH=$(date -u -d "$LABELED_AT" +%s)
                 OUTSTANDING_AGE=$((NOW - LABELED_EPOCH))
                 if (( OUTSTANDING_AGE >= STUCK_REVIEW_THRESHOLD_SECONDS )); then
-                  echo "Stuck review-outstanding detected: #${NUMBER} \"${TITLE}\" (outstanding ${OUTSTANDING_AGE}s)" >&2
-                  gh pr edit "$NUMBER" --repo "$REPO" --remove-label review-outstanding
-                  gh pr edit "$NUMBER" --repo "$REPO" --add-label needs-review
-                  gh pr comment "$NUMBER" --repo "$REPO" --body \
-                    "\`review-outstanding\` has been set for ${OUTSTANDING_AGE}s with no verdict posted -- the dispatched reviewer job likely never completed (dropped delivery, crashed run). Clearing it and enqueueing a fresh reviewer job (platform#3393)."
-                  jq -nc --argjson number "$NUMBER" --arg title "$TITLE" \
-                    '{number: $number, title: $title, reason: "stuck-review-outstanding"}' >> /tmp/orphaned-prs.jsonl
+                  if verdict_exists_for_sha "$SHA" "$LABELS"; then
+                    echo "review-outstanding stuck (${OUTSTANDING_AGE}s) but head SHA ${SHA} already has a recorded verdict for #${NUMBER} -- clearing the stale label, not redispatching (platform#4298)." >&2
+                    gh pr edit "$NUMBER" --repo "$REPO" --remove-label review-outstanding
+                    gh pr comment "$NUMBER" --repo "$REPO" --body \
+                      "\`review-outstanding\` sat for ${OUTSTANDING_AGE}s, but the current head commit \`${SHA}\` already has a recorded reviewer verdict -- the dispatched job most likely posted it and then crashed before clearing this label. Clearing it without enqueueing a redundant reviewer (platform#4298)."
+                  else
+                    echo "Stuck review-outstanding detected: #${NUMBER} \"${TITLE}\" (outstanding ${OUTSTANDING_AGE}s)" >&2
+                    gh pr edit "$NUMBER" --repo "$REPO" --remove-label review-outstanding
+                    gh pr edit "$NUMBER" --repo "$REPO" --add-label needs-review
+                    gh pr comment "$NUMBER" --repo "$REPO" --body \
+                      "\`review-outstanding\` has been set for ${OUTSTANDING_AGE}s with no verdict posted -- the dispatched reviewer job likely never completed (dropped delivery, crashed run). Clearing it and enqueueing a fresh reviewer job (platform#3393)."
+                    jq -nc --argjson number "$NUMBER" --arg title "$TITLE" \
+                      '{number: $number, title: $title, reason: "stuck-review-outstanding"}' >> /tmp/orphaned-prs.jsonl
+                  fi
                 fi
               fi
               continue
