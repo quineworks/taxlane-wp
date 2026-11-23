@@ -20,14 +20,17 @@
 # instead of re-implementing decideClose() inline.
 #
 # Cross-repo tracking parents are supported by the API (same owner, not
-# same repo) but this workflow only ever runs with `github.token`, which
-# GitHub Actions scopes to the repo the workflow runs in — it cannot read
-# or write a parent living in a different repo. When that happens the `gh
-# api`/`gh issue close` calls below simply fail with 403/404 and the step
-# logs a warning and exits clean rather than red-failing the run: there is
-# no fix available from inside this workflow (a broader-scoped token is a
-# separate, larger decision, out of #564's scope) so failing loud here
-# would just be permanent noise, not an actionable signal.
+# same repo). This used to be a real gap when every call below ran under
+# the plain `github.token` (scoped to only the repo the workflow runs in,
+# so it could neither read nor write a parent living in a different repo —
+# "a broader-scoped token is a separate, larger decision, out of #564's
+# scope"). platform#4294/#4301 made that broader-scoped token decision (see
+# below) for the cross-repo sub-issue-counting fix it needed anyway, which
+# incidentally also closes this gap: every `gh api`/`gh issue close` call
+# below now runs under the org-wide PAT, so a cross-repo parent is both
+# readable and writable like any same-repo one. The `::warning::`-then-
+# exit-clean fallbacks below are kept as a defensive fail-soft (e.g. a
+# transient API error), not because cross-repo access is expected to fail.
 #
 # platform#1064: a *readable* cross-repo parent with unreadable cross-repo
 # children is a different, sneakier failure than the 403/404 above — the
@@ -56,6 +59,33 @@
 # Generic (not platform-only) — no denylist entry needed in
 # bootstrap-product-repo.sh, this backfills to every product repo the same
 # way closing-keyword-check.yml / issue-close-enforcer.yml did.
+#
+# platform#4294/#4301: both `fetchAllSubIssues()` and `fetchExpectedTotal()`
+# below used to run under the plain per-run `github.token`, which GitHub
+# Actions scopes to ONLY the repo the workflow is running in — it has no
+# read access to any other repo at all, not even within the same org. For a
+# parent with a cross-repo child (e.g. blinkblocks#142 linked to
+# platform#4273), GitHub silently omits the unreadable child from both the
+# REST `sub_issues` list AND the GraphQL `subIssuesSummary.total` count, so
+# the two matched each other (both undercounting the same way) and
+# `decideClose()`'s own fail-safe never tripped — blinkblocks#142 sat
+# permanently stuck, repeatedly reopened by tracking-parent-hold-guard.yml,
+# because neither number this workflow computed was ever the true one.
+# #1064's fail-safe was built to catch REST-vs-GraphQL disagreement, not a
+# same-direction blind spot in both.
+#
+# Fix: assume `quineworks-github-actions` (OIDC, trusted for the generic
+# `repo:quineworks/*:*` subject — this workflow propagates to every product
+# repo, not just platform, so the platform-only `github_actions_platform`
+# role won't do) and fetch the org-wide `github_token` PAT from the
+# field-scoped secrets broker (`infra/secrets_broker.tf`,
+# `aws_iam_role_policy.github_actions_invoke_secrets_broker` already grants
+# this role GET /secret access) — the same PAT every agent task already
+# uses for cross-repo work (e.g. `agent/bin/link-sub-issue`). That PAT has
+# real read access across every quineworks/* repo, so both fetches below now
+# see the true, complete picture regardless of which repo a sub-issue lives
+# in. Same shape as `status.yml`/`sync-governance-workflows.yml`'s own
+# cross-repo-token fetch.
 name: tracking-parent-auto-closer
 
 on:
@@ -66,6 +96,7 @@ permissions:
   contents: read
   issues: write
   pull-requests: read
+  id-token: write
 
 concurrency:
   group: tracking-parent-auto-closer-${{ github.event.issue.number }}
@@ -78,9 +109,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Fetch cross-repo GitHub token
+        # Reads the `github_token` field from the field-scoped secrets
+        # broker (platform#2276) — see this workflow's header comment
+        # (platform#4294/#4301) for why the plain `github.token` can't see
+        # cross-repo sub-issues.
+        run: |
+          BROKER_RESPONSE=$(curl -fsS \
+            --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+            --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" \
+            -H "x-amz-security-token: ${AWS_SESSION_TOKEN}" \
+            "https://r4c8q4snw0.execute-api.us-east-1.amazonaws.com/secret?field=github_token")
+          GITHUB_PAT=$(jq -r '.value' <<<"$BROKER_RESPONSE")
+          echo "::add-mask::${GITHUB_PAT}"
+          echo "GH_TOKEN=${GITHUB_PAT}" >> "$GITHUB_ENV"
+
       - name: Check for a tracking parent and auto-close it if every sub-issue is closed
         env:
-          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           EVENT_ACTION: ${{ github.event.action }}
