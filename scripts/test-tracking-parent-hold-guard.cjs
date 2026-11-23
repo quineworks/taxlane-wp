@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { decideBypass } = require('./tracking-parent-hold-guard.cjs');
+const { decideBypass, decideRemediation } = require('./tracking-parent-hold-guard.cjs');
 
 test('normal auto-closer close, no hold ever applied -> isBypass: false', () => {
   const result = decideBypass({
@@ -95,4 +95,44 @@ test('label/unlabel events after close time are ignored (a later re-label does n
   });
   assert.equal(result.isBypass, false);
   assert.match(result.reason, /not present at close time/);
+});
+
+// platform#4252: decideRemediation() is the backstop layered on top of
+// decideBypass() — it only changes what happens *once* isBypass is true.
+
+test('decideRemediation: not a bypass -> action none, regardless of sub-issue state', () => {
+  const result = decideRemediation({ isBypass: false, subIssues: [{ number: 1, state: 'open' }], expectedTotal: 1 });
+  assert.equal(result.action, 'none');
+});
+
+test('decideRemediation: bypass, but every sub-issue genuinely closed -> self-heal, not revert', () => {
+  const subIssues = [
+    { number: 96, state: 'closed' },
+    { number: 97, state: 'closed' },
+  ];
+  const result = decideRemediation({ isBypass: true, subIssues, expectedTotal: 2 });
+  assert.equal(result.action, 'self-heal');
+  assert.match(result.reason, /DoD genuinely met/);
+});
+
+test('decideRemediation: bypass, a sub-issue still open -> revert (genuine bypass)', () => {
+  const subIssues = [
+    { number: 96, state: 'closed' },
+    { number: 97, state: 'open' },
+  ];
+  const result = decideRemediation({ isBypass: true, subIssues, expectedTotal: 2 });
+  assert.equal(result.action, 'revert');
+  assert.match(result.reason, /#97/);
+});
+
+test('decideRemediation: bypass, fetched list truncated vs. the true linked total -> revert (fails safe)', () => {
+  const subIssues = [{ number: 96, state: 'closed' }];
+  const result = decideRemediation({ isBypass: true, subIssues, expectedTotal: 2 });
+  assert.equal(result.action, 'revert');
+  assert.match(result.reason, /truncated/);
+});
+
+test('decideRemediation: bypass, no sub-issues linked -> revert (nothing verified yet)', () => {
+  const result = decideRemediation({ isBypass: true, subIssues: [], expectedTotal: 0 });
+  assert.equal(result.action, 'revert');
 });

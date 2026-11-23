@@ -24,6 +24,19 @@
 # `decideBypass()` treats that actor as always legitimate and short-circuits
 # before looking at label history, so this guard can never fight the
 # auto-closer it's meant to protect.
+#
+# platform#4252: previously this reopened + restored the hold on every
+# detected bypass unconditionally, with no check on whether the DoD was
+# actually met — so genuinely-done work that was closed directly instead of
+# through `tracking-parent-auto-closer.yml` got reopened anyway, forcing an
+# agent to repeat the exact "remove hold, let the auto-closer close it"
+# remediation this guard's own comment prescribes. `decideRemediation()`
+# (`scripts/tracking-parent-hold-guard.cjs`) is the backstop layered on top
+# of `decideBypass()`: on a detected bypass it now also runs
+# `decideClose()`'s own sub-issues/GraphQL-total verification against the
+# closed issue's own sub-issues (by convention the hold only ever sits on a
+# tracking parent) before deciding whether to self-heal (remove the hold,
+# leave it closed) or revert (reopen + restore the hold, as before).
 name: tracking-parent-hold-guard
 
 on:
@@ -55,7 +68,7 @@ jobs:
           cat > /tmp/tracking-parent-hold-guard.js <<'NODE_EOF'
           'use strict';
           const { execFileSync } = require('child_process');
-          const { decideBypass } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-hold-guard.cjs');
+          const { decideBypass, decideRemediation } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-hold-guard.cjs');
 
           const REPO = process.env.REPO;
           const ISSUE_NUMBER = process.env.ISSUE_NUMBER;
@@ -81,16 +94,77 @@ jobs:
             return events;
           }
 
+          function fetchAllSubIssues(ownerRepo, number) {
+            const issues = [];
+            let page = 1;
+            for (;;) {
+              const out = execFileSync('gh', [
+                'api',
+                `repos/${ownerRepo}/issues/${number}/sub_issues`,
+                '-X', 'GET',
+                '-f', 'per_page=100',
+                '-f', `page=${page}`,
+              ], { encoding: 'utf8' });
+              const batch = JSON.parse(out);
+              issues.push(...batch);
+              if (batch.length < 100) break;
+              page += 1;
+            }
+            return issues;
+          }
+
+          function fetchExpectedTotal(ownerRepo, number) {
+            const [owner, repo] = ownerRepo.split('/');
+            const query = 'query($owner:String!,$repo:String!,$number:Int!){ ' +
+              'repository(owner:$owner,name:$repo){ issue(number:$number){ ' +
+              'subIssuesSummary { total } } } }';
+            const out = execFileSync('gh', [
+              'api', 'graphql',
+              '-f', `query=${query}`,
+              '-f', `owner=${owner}`,
+              '-f', `repo=${repo}`,
+              '-F', `number=${number}`,
+            ], { encoding: 'utf8' });
+            return JSON.parse(out).data.repository.issue.subIssuesSummary.total;
+          }
+
           const events = fetchAllEvents(REPO, ISSUE_NUMBER);
-          const { isBypass, reason } = decideBypass({ events, closedAt: CLOSED_AT, closedByLogin: CLOSED_BY });
-          console.log(`decideBypass(${REPO}#${ISSUE_NUMBER}): isBypass=${isBypass} — ${reason}`);
+          const { isBypass, reason: bypassReason } = decideBypass({ events, closedAt: CLOSED_AT, closedByLogin: CLOSED_BY });
+          console.log(`decideBypass(${REPO}#${ISSUE_NUMBER}): isBypass=${isBypass} — ${bypassReason}`);
 
           if (!isBypass) process.exit(0);
+
+          // Fail safe: if either fetch can't be trusted, decideRemediation()
+          // below still gets a well-formed (if empty/unverifiable) input and
+          // falls through to 'revert' — never silently skips the guard.
+          let subIssues = [];
+          let expectedTotal;
+          try {
+            subIssues = fetchAllSubIssues(REPO, ISSUE_NUMBER);
+            expectedTotal = fetchExpectedTotal(REPO, ISSUE_NUMBER);
+          } catch (e) {
+            console.log(`::warning::Could not verify ${REPO}#${ISSUE_NUMBER}'s sub-issues/total — treating DoD as unverified.`);
+          }
+
+          const { action, reason } = decideRemediation({ isBypass, subIssues, expectedTotal });
+          console.log(`decideRemediation(${REPO}#${ISSUE_NUMBER}): action=${action} — ${reason}`);
+
+          if (action === 'self-heal') {
+            execFileSync('gh', ['issue', 'edit', ISSUE_NUMBER, '--repo', REPO, '--remove-label', 'tracking-parent-hold'], { stdio: 'inherit' });
+
+            const selfHealComment = '🔓 **tracking-parent-hold bypass detected, but left closed — DoD verified met.** ' +
+              bypassReason + ' ' + reason + ' See platform#4252: a direct close that genuinely satisfies the ' +
+              'tracking parent\'s DoD is self-healed (hold removed, issue stays closed) rather than reopened, ' +
+              'since reopening verified-done work would just force the same remediation again.';
+            execFileSync('gh', ['issue', 'comment', ISSUE_NUMBER, '--repo', REPO, '--body', selfHealComment], { stdio: 'inherit' });
+            console.log(`Self-healed ${REPO}#${ISSUE_NUMBER}: removed tracking-parent-hold, left closed.`);
+            process.exit(0);
+          }
 
           execFileSync('gh', ['issue', 'reopen', ISSUE_NUMBER, '--repo', REPO], { stdio: 'inherit' });
           execFileSync('gh', ['issue', 'edit', ISSUE_NUMBER, '--repo', REPO, '--add-label', 'tracking-parent-hold'], { stdio: 'inherit' });
 
-          const commentBody = '🔒 **tracking-parent-hold bypass detected and reverted.** ' + reason + ' ' +
+          const commentBody = '🔒 **tracking-parent-hold bypass detected and reverted.** ' + bypassReason + ' ' + reason + ' ' +
             'Reopening and restoring `tracking-parent-hold` automatically — see platform#3253 (this exact ' +
             'pattern recurred three times before a prompt-only guardrail proved insufficient). This is not a ' +
             'judgment call on whether the tracking parent\'s definition of done is actually met: if it is, ' +

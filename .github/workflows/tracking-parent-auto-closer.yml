@@ -39,6 +39,20 @@
 # REST list's length before trusting it — `decideClose()` fails safe (logs
 # a warning, leaves the parent open) if the two don't match.
 #
+# platform#4252: also triggers on `unlabeled` (filtered below to
+# `tracking-parent-hold`) on the issue itself — previously the only trigger
+# was `issues: closed` on a *sub-issue*, so if every sub-issue was already
+# closed before the hold was removed (the common case), nothing re-fired
+# and the parent sat open indefinitely despite the hold-guard/cto.md
+# remediation being "remove the hold and let the auto-closer close it".
+# `resolveTarget()` (`scripts/tracking-parent-auto-closer.cjs`) picks the
+# right recheck target for each event type: the issue itself for
+# `unlabeled`, its tracking parent (via `GET .../parent`, unchanged) for
+# `closed`. The `if:` below can't be expressed in `on.issues.types` (GitHub
+# Actions has no label-name filter there), so it's a job-level condition
+# instead — any `unlabeled` event for a label other than
+# `tracking-parent-hold` exits before checkout.
+#
 # Generic (not platform-only) — no denylist entry needed in
 # bootstrap-product-repo.sh, this backfills to every product repo the same
 # way closing-keyword-check.yml / issue-close-enforcer.yml did.
@@ -46,7 +60,7 @@ name: tracking-parent-auto-closer
 
 on:
   issues:
-    types: [closed]
+    types: [closed, unlabeled]
 
 permissions:
   contents: read
@@ -59,6 +73,7 @@ concurrency:
 
 jobs:
   auto-close:
+    if: github.event.action == 'closed' || github.event.label.name == 'tracking-parent-hold'
     runs-on: ondemand-x86_64
     steps:
       - uses: actions/checkout@v4
@@ -68,14 +83,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_ACTION: ${{ github.event.action }}
         run: |
           cat > /tmp/tracking-parent-auto-closer.js <<'NODE_EOF'
           'use strict';
           const { execFileSync } = require('child_process');
-          const { decideClose } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-auto-closer.cjs');
+          const { decideClose, resolveTarget } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-auto-closer.cjs');
 
           const REPO = process.env.REPO;
           const ISSUE_NUMBER = process.env.ISSUE_NUMBER;
+          const EVENT_ACTION = process.env.EVENT_ACTION;
 
           function fetchAllSubIssues(ownerRepo, number) {
             const issues = [];
@@ -111,29 +128,41 @@ jobs:
             return JSON.parse(out).data.repository.issue.subIssuesSummary.total;
           }
 
-          let parent;
-          try {
-            const out = execFileSync('gh', ['api', `repos/${REPO}/issues/${ISSUE_NUMBER}/parent`], { encoding: 'utf8' });
-            parent = JSON.parse(out);
-          } catch (e) {
-            console.log(`#${ISSUE_NUMBER} has no parent issue — nothing to do.`);
-            process.exit(0);
+          let parent = null;
+          if (EVENT_ACTION !== 'unlabeled') {
+            try {
+              const out = execFileSync('gh', ['api', `repos/${REPO}/issues/${ISSUE_NUMBER}/parent`], { encoding: 'utf8' });
+              parent = JSON.parse(out);
+            } catch (e) {
+              console.log(`#${ISSUE_NUMBER} has no parent issue — nothing to do.`);
+              process.exit(0);
+            }
           }
 
-          const parentRepo = parent.repository && parent.repository.full_name;
-          const parentNumber = parent.number;
-          if (!parentRepo || !parentNumber) {
+          const target = resolveTarget({ eventAction: EVENT_ACTION, repo: REPO, issueNumber: Number(ISSUE_NUMBER), parent });
+          if (!target) {
             console.log('::warning::Parent response missing repository/number fields — nothing to do.');
             process.exit(0);
           }
+          const { repo: parentRepo, number: parentNumber } = target;
 
-          if (parent.state === 'closed') {
-            console.log(`Parent ${parentRepo}#${parentNumber} is already closed — nothing to do.`);
+          let targetIssue;
+          try {
+            const out = execFileSync('gh', ['api', `repos/${parentRepo}/issues/${parentNumber}`], { encoding: 'utf8' });
+            targetIssue = JSON.parse(out);
+          } catch (e) {
+            console.log(`::warning::Could not fetch ${parentRepo}#${parentNumber} itself ` +
+              `(likely a cross-repo token scope limit — see this workflow's header comment) — nothing done.`);
             process.exit(0);
           }
 
-          const hasHoldLabel = Array.isArray(parent.labels) &&
-            parent.labels.some((l) => l.name === 'tracking-parent-hold');
+          if (targetIssue.state === 'closed') {
+            console.log(`${parentRepo}#${parentNumber} is already closed — nothing to do.`);
+            process.exit(0);
+          }
+
+          const hasHoldLabel = Array.isArray(targetIssue.labels) &&
+            targetIssue.labels.some((l) => l.name === 'tracking-parent-hold');
 
           let subIssues;
           try {

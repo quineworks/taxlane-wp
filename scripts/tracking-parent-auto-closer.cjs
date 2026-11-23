@@ -54,7 +54,42 @@ function decideClose(subIssues, hasHoldLabel, expectedTotal) {
   };
 }
 
-module.exports = { decideClose };
+// platform#4252: the dead end this fixes — `tracking-parent-hold-guard.yml`
+// and `cto.md` both tell an agent to "remove tracking-parent-hold and let
+// the auto-closer close it", but until this change the only trigger was
+// `issues: closed` on a *sub-issue*. If every sub-issue was already closed
+// before the hold was removed (the common case — the hold is usually the
+// last thing blocking closure), nothing re-fired and the parent just sat
+// open. `tracking-parent-auto-closer.yml` now also triggers on `unlabeled`
+// (filtered to `tracking-parent-hold`) on the issue itself, so hold-removal
+// alone is sufficient.
+//
+// resolveTarget({ eventAction, repo, issueNumber, parent }) -> { repo, number } | null
+//
+// eventAction: the webhook's `github.event.action` — 'closed' or
+// 'unlabeled'.
+// repo, issueNumber: the issue the webhook fired on (`owner/repo`, number).
+// parent: only consulted for a 'closed' event — the `GET .../parent`
+// response for the just-closed issue, or null/undefined if it has none.
+//
+// For 'unlabeled', the issue the hold was just removed from *is* the
+// candidate tracking parent to recheck, so no parent lookup is needed. For
+// 'closed', behavior is unchanged: resolve the just-closed issue's own
+// tracking parent, if any.
+function resolveTarget({ eventAction, repo, issueNumber, parent }) {
+  if (eventAction === 'unlabeled') {
+    return { repo, number: issueNumber };
+  }
+
+  const parentRepo = parent && parent.repository && parent.repository.full_name;
+  const parentNumber = parent && parent.number;
+  if (!parentRepo || !parentNumber) {
+    return null;
+  }
+  return { repo: parentRepo, number: parentNumber };
+}
+
+module.exports = { decideClose, resolveTarget };
 
 if (require.main === module) {
   // Wired up in #564: fetch `GET .../parent` on the just-closed issue, then
