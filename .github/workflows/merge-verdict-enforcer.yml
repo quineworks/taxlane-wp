@@ -88,7 +88,7 @@ jobs:
           if ! retry gh label create merge-missing-verdict \
             --repo "$REPO" \
             --color b60205 \
-            --description "PR merged without a successful quineworks/review-verdict status on its head SHA — platform#4215/#4220" \
+            --description "PR merged without a review-verdict status on its head SHA — platform#4215/#4220" \
             --force; then
             echo "::error::gh label create failed after 5 attempts (transient GitHub API 5xx)" >&2
             exit 1
