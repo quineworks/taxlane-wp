@@ -48,6 +48,18 @@
 # now only runs once discover has confirmed the repo is actually ready to
 # `npm ci`/`npm run e2e`, which is also the only point a lock file is
 # guaranteed to exist.
+#
+# blinkblocks#88/#100: two BlinkBlocks-specific pieces (the
+# `ondemand-x86_64-isolated` runner pool below, and the closing
+# load-time-budget step) live directly in this shared template, each
+# gated on `github.repository == 'quineworks/blinkblocks'` rather than
+# kept as a local edit in that repo's own synced copy. They were
+# originally local edits; blinkblocks#130 found they'd been silently
+# reverted by this exact sync (bootstrap-product-repo.sh does a raw
+# enumerate-and-overwrite with no per-repo merge, and this file isn't on
+# DENYLIST), so they're folded in here instead so the next resync can't
+# strip them again. Harmless to every other repo: both conditions are
+# false everywhere else, so behavior there is unchanged.
 name: post-deploy-e2e
 
 on:
@@ -69,7 +81,7 @@ jobs:
     if: |
       (github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success') &&
       !contains(fromJSON('["quineworks/tax-lane", "quineworks/taxlane-wp", "quineworks/taxlane-php"]'), github.repository)
-    runs-on: ondemand-x86_64
+    runs-on: ${{ github.repository == 'quineworks/blinkblocks' && 'ondemand-x86_64-isolated' || 'ondemand-x86_64' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -152,3 +164,13 @@ jobs:
         run: |
           export "${E2E_ENV_VAR_NAME}=${E2E_LIVE_URL}"
           npm run e2e
+
+      # blinkblocks#100: `check:load-budget` isn't a cross-repo convention
+      # the generic discover step above knows about, just blinkblocks's own
+      # script (scripts/check-load-budget.cjs), so it's gated directly on
+      # this repo rather than threaded through discover's generic output.
+      - name: Verify load-time budget against the deployed site (blinkblocks#100)
+        if: steps.discover.outputs.ready == 'true' && github.repository == 'quineworks/blinkblocks'
+        env:
+          BLINKBLOCKS_LOAD_BUDGET_URL: ${{ steps.discover.outputs.live_url }}
+        run: npm run check:load-budget
