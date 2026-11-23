@@ -37,6 +37,19 @@
 # closed issue's own sub-issues (by convention the hold only ever sits on a
 # tracking parent) before deciding whether to self-heal (remove the hold,
 # leave it closed) or revert (reopen + restore the hold, as before).
+#
+# platform#4294/#4301: `fetchAllSubIssues()`/`fetchExpectedTotal()` below
+# used to run under the plain per-run `github.token`, scoped to only this
+# repo — for a parent with a cross-repo child (e.g. blinkblocks#142 linked
+# to platform#4273) GitHub silently omits the unreadable child from BOTH
+# the REST list and the GraphQL total, so they agreed with each other
+# while both undercounting, and `decideClose()`'s fail-safe never caught
+# it — this guard kept reverting #142's genuinely-complete close as a
+# false bypass. Same fix as `tracking-parent-auto-closer.yml`'s own header
+# comment: assume the generic `quineworks-github-actions` role (trusted
+# for `repo:quineworks/*:*`, since this workflow propagates to every
+# product repo) and fetch the org-wide `github_token` PAT from the secrets
+# broker, which has real read access across every quineworks/* repo.
 name: tracking-parent-hold-guard
 
 on:
@@ -46,6 +59,7 @@ on:
 permissions:
   contents: read
   issues: write
+  id-token: write
 
 concurrency:
   group: tracking-parent-hold-guard-${{ github.event.issue.number }}
@@ -57,9 +71,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::324568509417:role/quineworks-github-actions
+          aws-region: us-east-1
+
+      - name: Fetch cross-repo GitHub token
+        # Reads the `github_token` field from the field-scoped secrets
+        # broker (platform#2276) — see this workflow's header comment
+        # (platform#4294/#4301) for why the plain `github.token` can't see
+        # cross-repo sub-issues.
+        run: |
+          BROKER_RESPONSE=$(curl -fsS \
+            --aws-sigv4 "aws:amz:us-east-1:execute-api" \
+            --user "${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}" \
+            -H "x-amz-security-token: ${AWS_SESSION_TOKEN}" \
+            "https://r4c8q4snw0.execute-api.us-east-1.amazonaws.com/secret?field=github_token")
+          GITHUB_PAT=$(jq -r '.value' <<<"$BROKER_RESPONSE")
+          echo "::add-mask::${GITHUB_PAT}"
+          echo "GH_TOKEN=${GITHUB_PAT}" >> "$GITHUB_ENV"
+
       - name: Detect and self-heal a tracking-parent-hold bypass
         env:
-          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           CLOSED_AT: ${{ github.event.issue.closed_at }}
