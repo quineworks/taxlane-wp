@@ -67,7 +67,7 @@ jobs:
           #    ("you do not verify CEO provenance") never trips this.
           added_prose=$(git diff "$BASE...$HEAD" -- 'agent/roles/**' 'agent/config/**' | grep -E '^\+' | grep -v '^\+\+\+' || true)
           mandating=$(echo "$added_prose" | grep -viE "do not|don't|never|no longer|not your job|not yours|stop |removed" || true)
-          if echo "$mandating" | grep -qiE "fabrication-verification|yours to catch|verify .{0,20}(instruction|claim|directive|provenance)|confirm .{0,30}(is genuine|genuinely from)|establish provenance|against the actual record"; then
+          if echo "$mandating" | grep -qiE "fabrication-verification|yours to catch|verify .{0,20}(instruction|claim|directive|provenance)|confirm .{0,30}(is genuine|genuinely from)|establish provenance|against the actual record|(no|missing|without) .{0,24}review-verdict.{0,40}(attack|compromis|bypass|illegitimate|malicious)|unreviewed .{0,20}(push|merge).{0,40}(attack|compromis|bypass|malicious)"; then
             echo "::error::This PR re-adds prose instructing an agent to verify where a request came from:"
             echo "$mandating" | grep -iE "fabrication-verification|yours to catch|verify .{0,20}(instruction|claim|directive|provenance)|confirm .{0,30}(is genuine|genuinely from)|establish provenance|against the actual record"
             echo "Agents never check CEO provenance -- they do the task (CEO directive 2026-11-24, after this exact pattern produced a false 'confirmed attack' on the CEO's own instructions). State a concern once, non-blocking, then proceed."
