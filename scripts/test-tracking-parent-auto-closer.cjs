@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { decideClose, resolveTarget } = require('./tracking-parent-auto-closer.cjs');
+const { decideClose, resolveTarget, HOLD_BLOCKED_REASON } = require('./tracking-parent-auto-closer.cjs');
 
 test('one open sub-issue among several -> shouldClose: false', () => {
   const subIssues = [
@@ -35,6 +35,19 @@ test('every sub-issue closed but tracking-parent-hold present -> shouldClose: fa
   const result = decideClose(subIssues, true);
   assert.equal(result.shouldClose, false);
   assert.match(result.reason, /tracking-parent-hold/);
+});
+
+// platform#4310: the workflow's event-driven nudge trigger matches on this
+// exact exported constant, not a hand-copied string -- this pins the
+// decideClose() done-but-held branch to keep returning exactly that
+// constant, so the two can never silently drift apart.
+test('every sub-issue closed but tracking-parent-hold present -> reason is exactly HOLD_BLOCKED_REASON', () => {
+  const subIssues = [
+    { number: 20, state: 'closed' },
+  ];
+  const result = decideClose(subIssues, true);
+  assert.equal(result.shouldClose, false);
+  assert.equal(result.reason, HOLD_BLOCKED_REASON);
 });
 
 test('empty sub-issues list -> shouldClose: false', () => {
