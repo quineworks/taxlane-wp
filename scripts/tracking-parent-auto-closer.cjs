@@ -18,6 +18,17 @@
 // endpoint's cross-repo token-scope truncation (platform#1064). When given
 // and it doesn't match subIssues.length, the fetched list can't be trusted
 // as complete — fail safe rather than closing on a partial list.
+// platform#4310: the exact reason string decideClose() returns for the
+// "every sub-issue is closed, but tracking-parent-hold is still present"
+// branch below -- a parent becoming done-but-held at this instant is the
+// trigger `tracking-parent-auto-closer.yml` uses to invoke the event-driven
+// nudge Lambda immediately, instead of leaving it to the next daily sweep
+// tick (`tracking_parent_sweep_dispatch()`, services/telegram-webhook/
+// handler.py) to notice up to ~24h later. Exported as a constant (not
+// hand-copied at each call site) so the workflow's trigger condition can
+// never drift from this function's own wording.
+const HOLD_BLOCKED_REASON = 'tracking-parent-hold label present; holding despite all sub-issues being closed.';
+
 function decideClose(subIssues, hasHoldLabel, expectedTotal) {
   const issues = Array.isArray(subIssues) ? subIssues : [];
 
@@ -43,7 +54,7 @@ function decideClose(subIssues, hasHoldLabel, expectedTotal) {
   if (hasHoldLabel) {
     return {
       shouldClose: false,
-      reason: 'tracking-parent-hold label present; holding despite all sub-issues being closed.',
+      reason: HOLD_BLOCKED_REASON,
     };
   }
 
@@ -89,7 +100,7 @@ function resolveTarget({ eventAction, repo, issueNumber, parent }) {
   return { repo: parentRepo, number: parentNumber };
 }
 
-module.exports = { decideClose, resolveTarget };
+module.exports = { decideClose, resolveTarget, HOLD_BLOCKED_REASON };
 
 if (require.main === module) {
   // Wired up in #564: fetch `GET .../parent` on the just-closed issue, then
