@@ -110,6 +110,19 @@
 # (unique directory, cleaned before each job starts) -- switching every
 # scratch path from `/tmp/...` to `$RUNNER_TEMP/...` below removes the shared
 # namespace entirely rather than trying to lock around it.
+# taxlane-wp run 45313878073 (2026-11-24): `push-backstop` failed to
+# acquire `changelog-lock` after its 10-try/~45s budget, even though the
+# matching `append` job (same merge, taxlane-wp#45) had already written the
+# line -- a pure no-op, false-positive CI red. Root cause: `changelog-lock`
+# is one global DynamoDB item shared across every quineworks/* repo, not
+# per-repo, and this merge landed in the middle of a 4-way pileup -- two
+# jobs each in taxlane-wp and blinkblocks all racing for the same lock
+# within an 8-second window, serialized by the 60s TTL. 10 tries at 1-5s
+# backoff (~27s average, ~45s worst case) is enough for the usual 2-way
+# push/pull_request race within one repo, but not for several repos'
+# merges landing at once. 30 tries keeps the same per-try backoff but
+# triples the total wait budget, enough to ride out a multi-repo pileup
+# like this one without changing the lock/TTL design itself.
 name: changelog
 
 on:
@@ -149,7 +162,7 @@ jobs:
         id: lock
         run: |
           set +e
-          for i in $(seq 1 10); do
+          for i in $(seq 1 30); do
             NOW=$(date -u +%s)
             TTL=$((NOW + 60))
             OUT=$(aws dynamodb put-item \
@@ -168,7 +181,7 @@ jobs:
             fi
             sleep $(( (RANDOM % 5) + 1 ))
           done
-          echo "Could not acquire changelog lock after 10 tries" >&2
+          echo "Could not acquire changelog lock after 30 tries" >&2
           exit 1
 
       # Dedupe guard: on the platform#1239 backstop path, `push-backstop`
@@ -282,7 +295,7 @@ jobs:
         if: steps.find-prs.outputs.count != '0'
         run: |
           set +e
-          for i in $(seq 1 10); do
+          for i in $(seq 1 30); do
             NOW=$(date -u +%s)
             TTL=$((NOW + 60))
             OUT=$(aws dynamodb put-item \
@@ -301,7 +314,7 @@ jobs:
             fi
             sleep $(( (RANDOM % 5) + 1 ))
           done
-          echo "Could not acquire changelog lock after 10 tries" >&2
+          echo "Could not acquire changelog lock after 30 tries" >&2
           exit 1
 
       # Dedupe guard: on the normal path, `append` (triggered by this same
@@ -380,7 +393,7 @@ jobs:
         id: lock
         run: |
           set +e
-          for i in $(seq 1 10); do
+          for i in $(seq 1 30); do
             NOW=$(date -u +%s)
             TTL=$((NOW + 60))
             OUT=$(aws dynamodb put-item \
@@ -399,7 +412,7 @@ jobs:
             fi
             sleep $(( (RANDOM % 5) + 1 ))
           done
-          echo "Could not acquire changelog lock after 10 tries" >&2
+          echo "Could not acquire changelog lock after 30 tries" >&2
           exit 1
 
       - name: Insert backfill line
