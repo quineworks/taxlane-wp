@@ -86,6 +86,18 @@
 # see the true, complete picture regardless of which repo a sub-issue lives
 # in. Same shape as `status.yml`/`sync-governance-workflows.yml`'s own
 # cross-repo-token fetch.
+#
+# platform#4310: when the recheck below lands on "every sub-issue closed,
+# tracking-parent-hold still present" (decideClose()'s `HOLD_BLOCKED_REASON`
+# branch), that's the exact instant a parent becomes done-but-held -- this
+# run now invokes `quineworks-tracking-parent-hold-nudge`
+# (infra/tracking_parent_hold_nudge.tf, `handler.tracking_parent_hold_nudge`
+# in services/telegram-webhook/handler.py) directly via `aws lambda invoke`
+# to nudge the owning role immediately, instead of leaving it to
+# `tracking_parent_sweep_dispatch()`'s once-daily cron
+# (infra/tracking_parent_sweep_dispatch.tf) to notice up to ~24h later. That
+# daily sweep is unchanged and stays as the backstop for whatever this
+# event path misses.
 name: tracking-parent-auto-closer
 
 on:
@@ -138,7 +150,7 @@ jobs:
           cat > /tmp/tracking-parent-auto-closer.js <<'NODE_EOF'
           'use strict';
           const { execFileSync } = require('child_process');
-          const { decideClose, resolveTarget } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-auto-closer.cjs');
+          const { decideClose, resolveTarget, HOLD_BLOCKED_REASON } = require(process.env.GITHUB_WORKSPACE + '/scripts/tracking-parent-auto-closer.cjs');
 
           const REPO = process.env.REPO;
           const ISSUE_NUMBER = process.env.ISSUE_NUMBER;
@@ -236,7 +248,35 @@ jobs:
           const { shouldClose, reason } = decideClose(subIssues, hasHoldLabel, expectedTotal);
           console.log(`decideClose(${parentRepo}#${parentNumber}): shouldClose=${shouldClose} — ${reason}`);
 
-          if (!shouldClose) process.exit(0);
+          if (!shouldClose) {
+            // platform#4310: the parent just became done-but-held (every
+            // sub-issue closed, hold label still present) in this very
+            // workflow run. Nudge its owning role immediately instead of
+            // waiting for `tracking_parent_sweep_dispatch()`'s daily cron
+            // tick to notice — that sweep stays as the unchanged backstop
+            // for whatever this event-driven path misses (e.g. a
+            // cross-repo trigger gap). `tracking_parent_hold_nudge()`
+            // (services/telegram-webhook/handler.py) independently
+            // re-derives the same decision via the exact helpers the daily
+            // sweep uses, so a stale/wrong read here can't cause a bad
+            // nudge — it can only, at worst, cost one no-op Lambda call.
+            if (reason === HOLD_BLOCKED_REASON) {
+              try {
+                execFileSync('aws', [
+                  'lambda', 'invoke',
+                  '--function-name', 'quineworks-tracking-parent-hold-nudge',
+                  '--cli-binary-format', 'raw-in-base64-out',
+                  '--payload', JSON.stringify({ repo: parentRepo, number: parentNumber }),
+                  '/tmp/tracking-parent-hold-nudge-response.json',
+                ], { stdio: 'inherit' });
+                console.log(require('fs').readFileSync('/tmp/tracking-parent-hold-nudge-response.json', 'utf8'));
+              } catch (e) {
+                console.log(`::warning::Event-driven nudge invoke failed for ${parentRepo}#${parentNumber} — ` +
+                  `the daily tracking-parent-sweep cron remains the backstop. ${e.message}`);
+              }
+            }
+            process.exit(0);
+          }
 
           const closedList = subIssues.map((i) => '#' + i.number).join(', ');
           const commentBody = `All linked sub-issue(s) verified closed via the native sub-issues API: ${closedList}. ` +
