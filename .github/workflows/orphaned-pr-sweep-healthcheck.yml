@@ -38,6 +38,25 @@
 # itself does (sync-governance-workflows.yml + bootstrap-product-repo.sh,
 # not on that script's DENYLIST) — it only ever checks the repo it runs
 # in.
+#
+# platform#4423: the "no completed run found yet -- skipping" branch below
+# was itself a blind spot in a brand-new repo. `quineworks/tethra#22` sat
+# stranded for ~2h51m because orphaned-pr-sweep.yml's schedule trigger
+# never fired a single time in that repo from the workflow becoming
+# `active` (18:44:22Z, repo bootstrap) until 02:49:24Z -- over 8 hours --
+# despite this healthcheck itself firing correctly on `pull_request`/
+# `issues` events ~75 times across that exact window (new PRs, labels,
+# etc. kept landing throughout). Every one of those 75 runs hit "no
+# completed run found yet" and exited clean, because a workflow that has
+# *never* completed a run has no `LAST_COMPLETED` timestamp to measure
+# staleness from -- the original logic treated that as "too early to
+# tell" rather than "the thing I exist to catch." A schedule trigger that
+# silently never starts in a new repo is the same failure this workflow
+# already recovers from once it has a baseline; it just couldn't see the
+# zero-baseline case. Fixed by falling back to the workflow's own
+# `created_at` (when GitHub Actions first recognized the workflow file on
+# the default branch) as the staleness baseline whenever there's no
+# completed run yet -- same threshold, same recovery action.
 name: orphaned-pr-sweep-healthcheck
 
 on:
@@ -79,8 +98,16 @@ jobs:
           LAST_COMPLETED=$(gh api "repos/${REPO}/actions/workflows/orphaned-pr-sweep.yml/runs?status=completed&per_page=1" \
             --jq '.workflow_runs[0].created_at')
           if [[ -z "$LAST_COMPLETED" || "$LAST_COMPLETED" == "null" ]]; then
-            echo "No completed orphaned-pr-sweep run found yet -- skipping." >&2
-            exit 0
+            # platform#4423: no completed run ever recorded is not "too
+            # early to tell" -- fall back to when the workflow file itself
+            # became active as the staleness baseline, so a schedule
+            # trigger that never fires even once in a brand-new repo still
+            # gets caught instead of silently skipped forever.
+            LAST_COMPLETED=$(gh api "repos/${REPO}/actions/workflows/orphaned-pr-sweep.yml" --jq '.created_at')
+            if [[ -z "$LAST_COMPLETED" || "$LAST_COMPLETED" == "null" ]]; then
+              echo "orphaned-pr-sweep workflow metadata unavailable -- skipping." >&2
+              exit 0
+            fi
           fi
 
           LAST_EPOCH=$(date -u -d "$LAST_COMPLETED" +%s)
