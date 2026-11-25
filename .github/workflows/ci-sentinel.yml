@@ -45,7 +45,7 @@
 # workflows already gated on a *pre-merge* `pull_request` check
 # (closing-keyword-check, commitment-ledger-check, cost-gate-check,
 # no-security-theater, operator-boundary-check,
-# pouchbooks-feature-drift-check-test, qa-fixtures-check,
+# pouchbooks-feature-drift-check-test, qa-fixtures-check, scheduled-wake-check,
 # sitemap-lastmod-check, vpce-sg-check, and the `*-test`/request-review/
 # design-review workflows) — those block the PR itself on failure, so
 # they're already visible without a sentinel; and pouchbooks' `release`
