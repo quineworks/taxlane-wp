@@ -1,0 +1,33 @@
+# platform#4552: site/worker.js's CACHE_CONTROL_OVERRIDES map has twice
+# shipped missing an entry for a new file added to site/public/brand/ or
+# site/public/icons/ (blinkblocks-icon.png, then tethra-icon.svg), leaving
+# it served uncached. This PR-time gate runs
+# scripts/check-cache-control-coverage.cjs against the PR's own changes so
+# a third recurrence fails the check instead of shipping unnoticed.
+name: cache-control-coverage-check
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - "site/public/brand/**"
+      - "site/public/icons/**"
+      - "site/public/favicon*"
+      - "site/public/apple-touch-icon*"
+      - "site/worker.js"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-control-coverage-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check CACHE_CONTROL_OVERRIDES covers every brand/icon/favicon asset
+        run: node scripts/check-cache-control-coverage.cjs
