@@ -266,10 +266,25 @@ jobs:
             return 1
           }
 
-          if ! LABELS=$(retry gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")'); then
+          view_issue() {
+            gh issue view "$ISSUE_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | join(",")' \
+              > /tmp/issue-close-enforcer-labels.txt 2> /tmp/issue-close-enforcer-view.err
+          }
+
+          if ! retry view_issue; then
+            # A closed issue that's since been deleted resolves to a permanent
+            # GraphQL "could not resolve"/REST 410, not the transient 5xx this
+            # retry wrapper targets — there's no marker left to remove on a
+            # deleted issue, so treat it as nothing-to-do rather than failing.
+            if grep -qi 'could not resolve to an issue or pull request\|this issue was deleted' /tmp/issue-close-enforcer-view.err; then
+              echo "Issue #${ISSUE_NUMBER} no longer resolvable (deleted) — nothing to self-heal." >&2
+              exit 0
+            fi
             echo "::error::gh issue view failed after 5 attempts (transient GitHub API 5xx) — #2195" >&2
+            cat /tmp/issue-close-enforcer-view.err >&2
             exit 1
           fi
+          LABELS=$(cat /tmp/issue-close-enforcer-labels.txt)
           if echo ",${LABELS}," | grep -q ',needs-close-check,'; then
             if ! retry gh issue edit "$ISSUE_NUMBER" --repo "$REPO" --remove-label needs-close-check; then
               echo "::error::gh issue edit --remove-label failed after 5 attempts (transient GitHub API 5xx) — #2195" >&2
