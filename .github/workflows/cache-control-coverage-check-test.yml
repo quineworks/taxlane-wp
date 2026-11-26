@@ -1,0 +1,30 @@
+# platform#4552: CI coverage for `scripts/check-cache-control-coverage.cjs`'s
+# fixture test (`scripts/test-check-cache-control-coverage.cjs`). Same shape
+# as leaked-comment-check-test.yml — path-filtered so it only fires on PRs
+# actually touching the script, its test, or the live workflow that wires
+# it up.
+name: cache-control-coverage-check-test
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, edited, ready_for_review]
+    paths:
+      - "scripts/check-cache-control-coverage.cjs"
+      - "scripts/test-check-cache-control-coverage.cjs"
+      - ".github/workflows/cache-control-coverage-check.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-control-coverage-check-test-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ondemand-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run check-cache-control-coverage.cjs fixture tests
+        run: node scripts/test-check-cache-control-coverage.cjs
