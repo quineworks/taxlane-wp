@@ -60,12 +60,12 @@ concurrency:
 jobs:
   check:
     # Job id is "check" (matching the sibling closing-keyword-check.yml/
-    # commitment-ledger-check.yml/operator-boundary-check.yml convention),
-    # but that means all four report an identically-named "check" check run
-    # on the same commit — GitHub's required-status-check matching is by
-    # check-run name only, with no per-workflow disambiguation, so requiring
-    # bare "check" would be satisfied by any of the four, not specifically
-    # this one. This job-level `name:` makes the reported check-run name
+    # operator-boundary-check.yml convention), but that means all three
+    # report an identically-named "check" check run on the same commit —
+    # GitHub's required-status-check matching is by check-run name only,
+    # with no per-workflow disambiguation, so requiring bare "check" would
+    # be satisfied by any of the three, not specifically this one. This
+    # job-level `name:` makes the reported check-run name
     # (and hence the required-status-check context) unique: "qa-fixtures-check"
     # (verified live via `gh api repos/<repo>/commits/<sha>/check-runs`,
     # platform#1531).
