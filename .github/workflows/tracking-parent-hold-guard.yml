@@ -161,7 +161,25 @@ jobs:
             return JSON.parse(out).data.repository.issue.subIssuesSummary.total;
           }
 
-          const events = fetchAllEvents(REPO, ISSUE_NUMBER);
+          // platform#4605: the target issue can be deleted after closing
+          // (e.g. #4595) — `issues/{number}/events` then 404s, and unlike
+          // the sub-issues/total fetch below this call had no try/catch,
+          // so it crashed the whole job with exit 1 instead of recognizing
+          // there's nothing left to guard. A deleted issue can't be
+          // reopened/commented on either, so this isn't a case the
+          // sub-issues fail-safe's 'revert' path can handle -- skip
+          // outright rather than routing through it.
+          let events;
+          try {
+            events = fetchAllEvents(REPO, ISSUE_NUMBER);
+          } catch (e) {
+            const stderr = (e.stderr || '').toString();
+            if (/HTTP 404/.test(stderr) || /Not Found/.test(stderr)) {
+              console.log(`::warning::${REPO}#${ISSUE_NUMBER} returned 404 on issues/events -- likely deleted after closing. Nothing to verify, skipping guard.`);
+              process.exit(0);
+            }
+            throw e;
+          }
           const { isBypass, reason: bypassReason } = decideBypass({ events, closedAt: CLOSED_AT, closedByLogin: CLOSED_BY });
           console.log(`decideBypass(${REPO}#${ISSUE_NUMBER}): isBypass=${isBypass} — ${bypassReason}`);
 
