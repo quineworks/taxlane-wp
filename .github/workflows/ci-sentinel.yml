@@ -43,7 +43,7 @@
 # producing no run for workflow_run to see — but a real script bug in
 # any of them should still page someone. Deliberately left out:
 # workflows already gated on a *pre-merge* `pull_request` check
-# (closing-keyword-check, commitment-ledger-check, cost-gate-check,
+# (closing-keyword-check, cost-gate-check,
 # no-security-theater, operator-boundary-check,
 # pouchbooks-feature-drift-check-test, qa-fixtures-check, scheduled-wake-check,
 # sitemap-lastmod-check, vpce-sg-check, and the `*-test`/request-review/
